@@ -1,7 +1,7 @@
 """
-server.py — The Morning Ledger's minimal Kite backend
+server.py — The Morning Ledger's backend
 
-Does exactly two things, and nothing else:
+Does three things:
   1. POST /api/kite/exchange  — takes a request_token, exchanges it for an
      access_token using your api_secret (which lives ONLY here, as an
      environment variable — never sent to or stored in the browser), then
@@ -9,7 +9,16 @@ Does exactly two things, and nothing else:
      them to the app. The access_token itself is never sent back to the
      browser, by design — it's used once, server-side, then discarded from
      memory when the request finishes. Nothing is written to disk.
-  2. GET /healthz — a trivial endpoint so the hosting platform (Render/
+  2. GET /api/news?company=... — fetches Google News RSS for one company
+     and returns parsed articles as JSON. Added because the two free
+     anonymous CORS proxies the app relied on (CodeTabs, r.jina.ai) both
+     started failing — CodeTabs is currently rejecting requests with 400s
+     for many users (a known, reported issue, not specific to this app),
+     and Jina explicitly blocks anonymous traffic to news.google.com due
+     to abuse from other users of their service. A server making its own
+     direct request has no CORS restriction at all (CORS is a browser-only
+     rule) and isn't subject to either of those specific failures.
+  3. GET /healthz — a trivial endpoint so the hosting platform (Render/
      Railway) can confirm the service is alive.
 
 There is no database, no session storage, no logging of tokens or secrets.
@@ -18,7 +27,9 @@ Every request is independent and stateless.
 
 import hashlib
 import os
+from urllib.parse import quote
 
+import feedparser
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -32,10 +43,74 @@ KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
 KITE_SESSION_TOKEN_URL = "https://api.kite.trade/session/token"
 KITE_HOLDINGS_URL = "https://api.kite.trade/portfolio/holdings"
 
+# A normal browser User-Agent. Without this, some servers (including
+# occasionally Google's own infrastructure) are more likely to treat the
+# request as bot/scraper traffic and respond differently.
+NEWS_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
+
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/news", methods=["GET"])
+def fetch_news_for_company():
+    """
+    Query param: ?company=Aarti+Industries
+
+    Fetches Google News RSS for the given company name directly from this
+    server (no CORS issue, no anonymous-proxy abuse flag) and returns
+    parsed articles as JSON.
+    """
+    company = request.args.get("company", "").strip()
+    if not company:
+        return jsonify({"error": "company query parameter is required"}), 400
+
+    query = quote(f'"{company}" when:3d')
+    rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    try:
+        resp = requests.get(rss_url, headers=NEWS_FETCH_HEADERS, timeout=12)
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Could not reach Google News: {e}"}), 502
+
+    if resp.status_code != 200:
+        return jsonify({
+            "error": f"Google News returned HTTP {resp.status_code}",
+            "raw_response_snippet": resp.text[:300],
+        }), 502
+
+    try:
+        parsed = feedparser.parse(resp.content)
+    except Exception as e:
+        return jsonify({"error": f"Could not parse RSS response: {e}"}), 502
+
+    articles = []
+    for entry in parsed.entries[:5]:
+        raw_title = (entry.get("title") or "").strip()
+        title, source = raw_title, "Google News"
+        sep_idx = raw_title.rfind(" - ")
+        if sep_idx > 0:
+            title = raw_title[:sep_idx].strip()
+            source = raw_title[sep_idx + 3:].strip()
+
+        articles.append({
+            "title": title,
+            "source": source,
+            "url": entry.get("link", ""),
+            "published": entry.get("published", ""),
+        })
+
+    return jsonify({
+        "status": "success",
+        "company": company,
+        "count": len(articles),
+        "articles": articles,
+    })
 
 
 @app.route("/api/kite/exchange", methods=["POST"])
