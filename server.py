@@ -132,18 +132,27 @@ def healthz():
 @app.route("/api/quotes", methods=["GET"])
 def fetch_quotes():
     """
-    Query param: ?symbols=NSE:AARTIIND,NSE:VBL,BSE:TARIL
+    Query params:
+      ?symbols=NSE:AARTIIND,NSE:VBL,BSE:TARIL
+      &access_token=...  (returned by /api/kite/exchange after login;
+                          the phone stores this and sends it back here)
 
-    Returns last price and day-over-day % change for each symbol, using
-    the access_token cached in memory from the most recent successful
-    Kite login. If no login has happened this session (or the server
-    restarted since), returns a clear error rather than guessing.
+    Returns last price and day-over-day % change for each symbol. The
+    access_token is preferably supplied by the caller (the phone, which
+    received and stored it after login) — this is more reliable than this
+    server's own in-memory cache, since Render can recycle the backend
+    process between two separate requests (the login call and this one),
+    silently wiping any in-memory state in between. The in-memory cache
+    is kept as a same-process fallback only, for the rare case both
+    requests happen to land on the same still-warm process.
     """
-    if not _session_cache["access_token"]:
+    access_token = request.args.get("access_token", "").strip() or _session_cache["access_token"]
+
+    if not access_token:
         return jsonify({
             "error": "no-active-kite-session",
             "message": "Log in via Kite first (Settings → Log in to Kite) — "
-                       "prices need today's access token, which isn't cached yet.",
+                       "prices need today's access token.",
         }), 401
 
     symbols_param = request.args.get("symbols", "").strip()
@@ -164,7 +173,7 @@ def fetch_quotes():
             params=params,
             headers={
                 "X-Kite-Version": "3",
-                "Authorization": f"token {KITE_API_KEY}:{_session_cache['access_token']}",
+                "Authorization": f"token {KITE_API_KEY}:{access_token}",
             },
             timeout=12,
         )
@@ -181,9 +190,8 @@ def fetch_quotes():
         }), 502
 
     if resp.status_code == 403 or data.get("error_type") == "TokenException":
-        # The cached token has actually expired (e.g. it's a new day) —
-        # clear it so the next attempt gives a clean "please log in again"
-        # rather than repeatedly trying a dead token.
+        # The token has actually expired (e.g. it's a new day) — clear any
+        # in-memory copy too, so a stale fallback doesn't linger.
         _session_cache["access_token"] = None
         return jsonify({
             "error": "kite-session-expired",
@@ -328,8 +336,11 @@ def exchange_and_fetch_holdings():
             "kite_response": token_data,
         }), 502
 
-    # Cache in memory (RAM only — see _session_cache docstring above) so
-    # /api/quotes can reuse it for the rest of today without a fresh login.
+    # Cache in memory too, as a same-process fallback (harmless if it works,
+    # irrelevant if Render recycles the process before the next request —
+    # the real reliability now comes from returning the token to the phone
+    # below, which persists correctly in localStorage regardless of which
+    # backend process later handles /api/quotes).
     _session_cache["access_token"] = access_token
     _session_cache["set_at"] = time.time()
 
@@ -363,7 +374,14 @@ def exchange_and_fetch_holdings():
 
     holdings = holdings_data.get("data", [])
 
-    # Step 3 — return only what the app needs. No access_token, no secrets.
+    # Step 3 — return what the app needs, including the access_token this
+    # time. This is a deliberate, explicit exception to "never send tokens
+    # to the browser" — made because relying on this server's own process
+    # memory to survive between two separate requests turned out to be
+    # unreliable (Render can recycle/restart processes between requests on
+    # the free tier). The api_secret itself is still never sent, logged, or
+    # written anywhere — only this short-lived access_token, which Kite
+    # itself invalidates daily regardless of what this app does with it.
     simplified = [
         {
             "ticker": h.get("tradingsymbol", ""),
@@ -380,6 +398,7 @@ def exchange_and_fetch_holdings():
         "status": "success",
         "count": len(simplified),
         "holdings": simplified,
+        "access_token": access_token,
         "user": {
             "user_name": token_data["data"].get("user_name", ""),
             "user_id": token_data["data"].get("user_id", ""),
