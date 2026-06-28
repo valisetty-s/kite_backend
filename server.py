@@ -106,7 +106,7 @@ KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
 
 KITE_SESSION_TOKEN_URL = "https://api.kite.trade/session/token"
 KITE_HOLDINGS_URL = "https://api.kite.trade/portfolio/holdings"
-KITE_QUOTE_OHLC_URL = "https://api.kite.trade/quote/ohlc"
+KITE_QUOTE_URL = "https://api.kite.trade/quote"
 
 # In-memory only — never written to disk, never logged, wiped on restart.
 # Kite access tokens are valid until ~6am IST the next day regardless of
@@ -137,14 +137,18 @@ def fetch_quotes():
       &access_token=...  (returned by /api/kite/exchange after login;
                           the phone stores this and sends it back here)
 
-    Returns last price and day-over-day % change for each symbol. The
-    access_token is preferably supplied by the caller (the phone, which
-    received and stored it after login) — this is more reliable than this
-    server's own in-memory cache, since Render can recycle the backend
-    process between two separate requests (the login call and this one),
-    silently wiping any in-memory state in between. The in-memory cache
-    is kept as a same-process fallback only, for the rare case both
-    requests happen to land on the same still-warm process.
+    Returns last price, day-over-day % change, today's volume, and a
+    same-day buy/sell pressure ratio for each symbol.
+
+    Note on what this can and can't tell you: Kite Connect does not
+    provide 52-week high/low or a historical volume average at all —
+    confirmed directly from Zerodha's own developer forum, where they
+    state Kite Connect is purely an execution platform and doesn't carry
+    that kind of fundamental/historical data. So "volume high or low"
+    here means something more specific and honest: whether today's BUYING
+    pressure is unusually one-sided compared to SELLING pressure right
+    now, using the same snapshot this call already fetches — not a
+    comparison against history, which Kite simply doesn't expose.
     """
     access_token = request.args.get("access_token", "").strip() or _session_cache["access_token"]
 
@@ -169,7 +173,7 @@ def fetch_quotes():
 
     try:
         resp = requests.get(
-            KITE_QUOTE_OHLC_URL,
+            KITE_QUOTE_URL,  # full /quote, not /quote/ohlc — adds volume + buy/sell quantities
             params=params,
             headers={
                 "X-Kite-Version": "3",
@@ -208,10 +212,26 @@ def fetch_quotes():
         change_pct = None
         if last_price is not None and prev_close:
             change_pct = round(((last_price - prev_close) / prev_close) * 100, 2)
+
+        buy_qty = q.get("buy_quantity") or 0
+        sell_qty = q.get("sell_quantity") or 0
+        total_qty = buy_qty + sell_qty
+        # Same-day pressure signal only — see the docstring above for why
+        # this isn't (and can't be) compared against any historical average.
+        pressure_flag = None
+        if total_qty > 0:
+            buy_ratio = buy_qty / total_qty
+            if buy_ratio >= 0.65:
+                pressure_flag = "buy-heavy"
+            elif buy_ratio <= 0.35:
+                pressure_flag = "sell-heavy"
+
         quotes[symbol] = {
             "last_price": last_price,
             "prev_close": prev_close,
             "change_pct": change_pct,
+            "volume": q.get("volume"),
+            "pressure_flag": pressure_flag,
         }
 
     return jsonify({"status": "success", "quotes": quotes})
