@@ -106,7 +106,7 @@ KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
 
 KITE_SESSION_TOKEN_URL = "https://api.kite.trade/session/token"
 KITE_HOLDINGS_URL = "https://api.kite.trade/portfolio/holdings"
-KITE_QUOTE_URL = "https://api.kite.trade/quote"
+KITE_QUOTE_URL = "https://api.kite.trade/quote/ohlc"  # ohlc works on all plans; /quote needs paid plan
 
 # In-memory only — never written to disk, never logged, wiped on restart.
 # Kite access tokens are valid until ~6am IST the next day regardless of
@@ -194,44 +194,39 @@ def fetch_quotes():
         }), 502
 
     if resp.status_code == 403 or data.get("error_type") == "TokenException":
-        # The token has actually expired (e.g. it's a new day) — clear any
-        # in-memory copy too, so a stale fallback doesn't linger.
         _session_cache["access_token"] = None
+        err_type = data.get("error_type", "unknown")
+        err_msg = data.get("message", "no message from Kite")
+        hint = " (If PermissionException: your Kite Connect plan does not include this endpoint)" if "Permission" in err_type else ""
         return jsonify({
             "error": "kite-session-expired",
-            "message": "Your Kite session has expired — log in again via Settings.",
+            "message": f"Kite HTTP {resp.status_code} [{err_type}]: {err_msg}{hint}",
+            "kite_response": data,
         }), 401
 
     if resp.status_code != 200 or data.get("status") != "success":
-        return jsonify({"error": "Kite rejected the quotes request.", "kite_response": data}), 400
+        return jsonify({"error": f"Kite HTTP {resp.status_code}: {data.get('message', 'unknown error')}", "kite_response": data}), 400
 
     quotes = {}
     for symbol, q in data.get("data", {}).items():
         last_price = q.get("last_price")
-        prev_close = q.get("ohlc", {}).get("close")
+        ohlc = q.get("ohlc", {})
+        prev_close = ohlc.get("close")
+        day_high = ohlc.get("high")
+        day_low = ohlc.get("low")
         change_pct = None
         if last_price is not None and prev_close:
             change_pct = round(((last_price - prev_close) / prev_close) * 100, 2)
-
-        buy_qty = q.get("buy_quantity") or 0
-        sell_qty = q.get("sell_quantity") or 0
-        total_qty = buy_qty + sell_qty
-        # Same-day pressure signal only — see the docstring above for why
-        # this isn't (and can't be) compared against any historical average.
-        pressure_flag = None
-        if total_qty > 0:
-            buy_ratio = buy_qty / total_qty
-            if buy_ratio >= 0.65:
-                pressure_flag = "buy-heavy"
-            elif buy_ratio <= 0.35:
-                pressure_flag = "sell-heavy"
-
+        range_pct = None
+        if day_high is not None and day_low is not None and day_high != day_low and last_price is not None:
+            range_pct = round(((last_price - day_low) / (day_high - day_low)) * 100, 1)
         quotes[symbol] = {
             "last_price": last_price,
             "prev_close": prev_close,
             "change_pct": change_pct,
-            "volume": q.get("volume"),
-            "pressure_flag": pressure_flag,
+            "day_high": day_high,
+            "day_low": day_low,
+            "range_pct": range_pct,
         }
 
     return jsonify({"status": "success", "quotes": quotes})
