@@ -1,426 +1,247 @@
-"""
-server.py — The Morning Ledger's backend
+# server.py — Morning Ledger backend
+# Handles: (1) Kite Connect OAuth exchange for holdings import
+#           (2) Yahoo Finance price + volume fetch — NO auth required
+#
+# Deploy on Render (free tier). Set these env vars in Render dashboard:
+#   KITE_API_KEY     — your Kite Connect app's API key
+#   KITE_API_SECRET  — your Kite Connect app's API secret
+#   FRONTEND_ORIGIN  — e.g. https://4valisetty-s.github.io
 
-Does three things:
-  1. POST /api/kite/exchange  — takes a request_token, exchanges it for an
-     access_token using your api_secret (which lives ONLY here, as an
-     environment variable — never sent to or stored in the browser), then
-     immediately uses that access_token to fetch your holdings and returns
-     them to the app. The access_token itself is never sent back to the
-     browser, by design — it's used once, server-side, then discarded from
-     memory when the request finishes. Nothing is written to disk.
-  2. GET /api/news?company=... — fetches Google News RSS for one company
-     and returns parsed articles as JSON. Added because the two free
-     anonymous CORS proxies the app relied on (CodeTabs, r.jina.ai) both
-     started failing — CodeTabs is currently rejecting requests with 400s
-     for many users (a known, reported issue, not specific to this app),
-     and Jina explicitly blocks anonymous traffic to news.google.com due
-     to abuse from other users of their service. A server making its own
-     direct request has no CORS restriction at all (CORS is a browser-only
-     rule) and isn't subject to either of those specific failures.
-  3. GET /healthz — a trivial endpoint so the hosting platform (Render/
-     Railway) can confirm the service is alive.
-
-There is no database, no session storage, no logging of tokens or secrets.
-Every request is independent and stateless.
-"""
-
-import hashlib
-import os
-from urllib.parse import quote
-
-import feedparser
-import requests
-from flask import Flask, jsonify, request
+import os, time, logging
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
+import yfinance as yf
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)  # Allow the PWA (hosted on a different domain) to call this API
 
-KITE_API_KEY = os.environ.get("KITE_API_KEY", "")
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "*")
+CORS(app, origins=FRONTEND_ORIGIN, supports_credentials=True)
+
+KITE_API_KEY    = os.environ.get("KITE_API_KEY", "")
 KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
 
-KITE_SESSION_TOKEN_URL = "https://api.kite.trade/session/token"
+KITE_EXCHANGE_URL = "https://api.kite.trade/session/token"
 KITE_HOLDINGS_URL = "https://api.kite.trade/portfolio/holdings"
 
-# A normal browser User-Agent. Without this, some servers (including
-# occasionally Google's own infrastructure) are more likely to treat the
-# request as bot/scraper traffic and respond differently.
-NEWS_FETCH_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-}
+# In-memory cache — only used for the holdings import flow
+_session_cache = {"access_token": None}
 
 
-"""
-server.py — The Morning Ledger's backend
+# ── Ticker conversion ──────────────────────────────────────────────────────
+# NSE tickers:  VBL        → VBL.NS
+# BSE/BE stocks: STLTECH-BE → STLTECH.BO  (BE-series only trade on BSE)
+# Kite prefix format (from frontend): NSE:VBL → VBL.NS
 
-Does four things:
-  1. POST /api/kite/exchange  — takes a request_token, exchanges it for an
-     access_token using your api_secret (which lives ONLY here, as an
-     environment variable — never sent to or stored in the browser), then
-     immediately uses that access_token to fetch your holdings and returns
-     them to the app. The access_token itself is never sent back to the
-     browser, by design. It IS kept in memory on this server afterward
-     (see _session_cache below) so the new /api/quotes endpoint can reuse
-     it for the rest of the day without asking you to log in again for
-     every single price check — but it is never written to disk, never
-     logged, and is wiped immediately if this process restarts.
-  2. GET /api/news?company=... — fetches Google News RSS for one company
-     and returns parsed articles as JSON. Added because the two free
-     anonymous CORS proxies the app relied on (CodeTabs, r.jina.ai) both
-     started failing — CodeTabs is currently rejecting requests with 400s
-     for many users (a known, reported issue, not specific to this app),
-     and Jina explicitly blocks anonymous traffic to news.google.com due
-     to abuse from other users of their service. A server making its own
-     direct request has no CORS restriction at all (CORS is a browser-only
-     rule) and isn't subject to either of those specific failures.
-  3. GET /api/quotes?symbols=NSE:AARTIIND,NSE:VBL — returns last price and
-     day-over-day change for a batch of stocks, using the access_token
-     cached in memory from your most recent Kite login. Requires having
-     logged in via Kite at least once this session (access tokens expire
-     daily, per Kite's own rules — this app doesn't work around that).
-  4. GET /healthz — a trivial endpoint so the hosting platform (Render/
-     Railway) can confirm the service is alive.
-
-There is no database. Nothing is ever written to disk. The one exception
-to "no persistence" is the in-memory access_token cache described above —
-explicitly scoped to RAM only, lost on every restart, never logged.
-"""
-
-import hashlib
-import os
-import time
-from urllib.parse import quote
-
-import feedparser
-import requests
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-
-app = Flask(__name__)
-CORS(app)  # Allow the PWA (hosted on a different domain) to call this API
-
-KITE_API_KEY = os.environ.get("KITE_API_KEY", "")
-KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
-
-KITE_SESSION_TOKEN_URL = "https://api.kite.trade/session/token"
-KITE_HOLDINGS_URL = "https://api.kite.trade/portfolio/holdings"
-KITE_QUOTE_URL = "https://api.kite.trade/quote/ohlc"  # ohlc works on all plans; /quote needs paid plan
-
-# In-memory only — never written to disk, never logged, wiped on restart.
-# Kite access tokens are valid until ~6am IST the next day regardless of
-# when they were issued, so caching this in RAM for the rest of a session
-# is safe and matches Kite's own token lifetime, not something this app
-# invents independently.
-_session_cache = {"access_token": None, "set_at": None}
-
-# A normal browser User-Agent. Without this, some servers (including
-# occasionally Google's own infrastructure) are more likely to treat the
-# request as bot/scraper traffic and respond differently.
-NEWS_FETCH_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-}
+def to_yahoo_ticker(raw: str) -> str:
+    """Convert NSE/BSE ticker to Yahoo Finance format."""
+    t = raw.strip().upper()
+    # Strip exchange prefix if sent as NSE:XXX or BSE:XXX
+    if ":" in t:
+        t = t.split(":", 1)[1]
+    # BE-series (book-entry, BSE odd-lot board) → .BO
+    if t.endswith("-BE"):
+        return t[:-3] + ".BO"
+    # Default to NSE
+    return t + ".NS"
 
 
-@app.route("/healthz", methods=["GET"])
+# ── /healthz ──────────────────────────────────────────────────────────────
+@app.route("/healthz")
 def healthz():
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/quotes", methods=["GET"])
-def fetch_quotes():
+# ── /api/kite/exchange — trade request_token for access_token (holdings) ──
+@app.route("/api/kite/exchange", methods=["POST"])
+def kite_exchange():
     """
-    Query params:
-      ?symbols=NSE:AARTIIND,NSE:VBL,BSE:TARIL
-      &access_token=...  (returned by /api/kite/exchange after login;
-                          the phone stores this and sends it back here)
-
-    Returns last price, day-over-day % change, today's volume, and a
-    same-day buy/sell pressure ratio for each symbol.
-
-    Note on what this can and can't tell you: Kite Connect does not
-    provide 52-week high/low or a historical volume average at all —
-    confirmed directly from Zerodha's own developer forum, where they
-    state Kite Connect is purely an execution platform and doesn't carry
-    that kind of fundamental/historical data. So "volume high or low"
-    here means something more specific and honest: whether today's BUYING
-    pressure is unusually one-sided compared to SELLING pressure right
-    now, using the same snapshot this call already fetches — not a
-    comparison against history, which Kite simply doesn't expose.
+    Exchange a Kite request_token for an access_token, then fetch holdings.
+    Called only during the holdings-import flow — not needed for prices.
     """
-    access_token = request.args.get("access_token", "").strip() or _session_cache["access_token"]
+    body = request.get_json(silent=True) or {}
+    request_token = body.get("request_token", "").strip()
+    if not request_token:
+        return jsonify({"error": "request_token missing"}), 400
+    if not KITE_API_KEY or not KITE_API_SECRET:
+        return jsonify({"error": "KITE_API_KEY / KITE_API_SECRET not set on server"}), 500
 
-    if not access_token:
-        return jsonify({
-            "error": "no-active-kite-session",
-            "message": "Log in via Kite first (Settings → Log in to Kite) — "
-                       "prices need today's access token.",
-        }), 401
-
-    symbols_param = request.args.get("symbols", "").strip()
-    if not symbols_param:
-        return jsonify({"error": "symbols query parameter is required, comma-separated"}), 400
-
-    symbols = [s.strip() for s in symbols_param.split(",") if s.strip()]
-    if not symbols:
-        return jsonify({"error": "no valid symbols provided"}), 400
-
-    # Kite's API takes repeated ?i=NSE:FOO&i=NSE:BAR params, not a single
-    # comma-joined one — build the query string accordingly.
-    params = [("i", s) for s in symbols]
-
-    try:
-        resp = requests.get(
-            KITE_QUOTE_URL,  # full /quote, not /quote/ohlc — adds volume + buy/sell quantities
-            params=params,
-            headers={
-                "X-Kite-Version": "3",
-                "Authorization": f"token {KITE_API_KEY}:{access_token}",
-            },
-            timeout=12,
-        )
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Could not reach Kite for quotes: {e}"}), 502
-
-    try:
-        data = resp.json()
-    except ValueError:
-        return jsonify({
-            "error": "Kite returned a response that wasn't valid JSON for quotes.",
-            "http_status": resp.status_code,
-            "raw_response_snippet": resp.text[:300],
-        }), 502
-
-    if resp.status_code == 403 or data.get("error_type") == "TokenException":
-        _session_cache["access_token"] = None
-        err_type = data.get("error_type", "unknown")
-        err_msg = data.get("message", "no message from Kite")
-        hint = " (If PermissionException: your Kite Connect plan does not include this endpoint)" if "Permission" in err_type else ""
-        return jsonify({
-            "error": "kite-session-expired",
-            "message": f"Kite HTTP {resp.status_code} [{err_type}]: {err_msg}{hint}",
-            "kite_response": data,
-        }), 401
-
+    import hashlib
+    checksum = hashlib.sha256(f"{KITE_API_KEY}{request_token}{KITE_API_SECRET}".encode()).hexdigest()
+    resp = requests.post(KITE_EXCHANGE_URL, data={
+        "api_key": KITE_API_KEY,
+        "request_token": request_token,
+        "checksum": checksum,
+    }, timeout=15)
+    data = resp.json()
     if resp.status_code != 200 or data.get("status") != "success":
-        return jsonify({"error": f"Kite HTTP {resp.status_code}: {data.get('message', 'unknown error')}", "kite_response": data}), 400
+        return jsonify({"error": "Exchange failed", "kite_response": data}), 400
+
+    access_token = data["data"]["access_token"]
+    _session_cache["access_token"] = access_token
+
+    # Immediately fetch holdings while we have the token
+    h_resp = requests.get(KITE_HOLDINGS_URL, headers={
+        "Authorization": f"token {KITE_API_KEY}:{access_token}",
+        "X-Kite-Version": "3",
+    }, timeout=15)
+    h_data = h_resp.json()
+    holdings = []
+    if h_resp.status_code == 200 and h_data.get("status") == "success":
+        for h in h_data.get("data", []):
+            holdings.append({
+                "ticker":   h.get("tradingsymbol", ""),
+                "exchange": h.get("exchange", "NSE"),
+                "quantity": h.get("quantity", 0),
+                "avg_cost": h.get("average_price", 0),
+            })
+
+    return jsonify({
+        "status": "success",
+        "access_token": access_token,
+        "holdings": holdings,
+    })
+
+
+# ── /api/quotes — Yahoo Finance prices, NO auth required ─────────────────
+@app.route("/api/quotes")
+def get_quotes():
+    """
+    Fetch current price, % change, volume, RVOL, 52-week H/L for a list of stocks.
+    Query param: symbols=VBL,TARIL,KAYNES,...  (plain NSE tickers, comma-separated)
+    Or:          symbols=NSE:VBL,NSE:TARIL,...  (with exchange prefix — stripped)
+
+    Uses Yahoo Finance — completely free, no API key, no login.
+    One yf.download() call covers all stocks (fast even for 96 stocks).
+
+    Returns per symbol:
+      last_price    — latest close (or current price if market is open)
+      change_pct    — % change vs previous close
+      day_high      — today's intraday high
+      day_low       — today's intraday low
+      volume        — today's traded volume
+      avg_vol_20d   — 20-session average volume
+      rvol          — relative volume = volume / avg_vol_20d
+      week52_high   — 52-week high
+      week52_low    — 52-week low
+      range_pct     — where in today's H-L range the price sits (0%=low, 100%=high)
+    """
+    raw_symbols = request.args.get("symbols", "")
+    if not raw_symbols:
+        return jsonify({"error": "symbols param missing"}), 400
+
+    tickers = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+    if not tickers:
+        return jsonify({"error": "no valid symbols"}), 400
+
+    # Convert to Yahoo format
+    yahoo_map = {}   # yahoo_ticker → original_ticker
+    for t in tickers:
+        yt = to_yahoo_ticker(t)
+        # strip exchange prefix for the key we return to the frontend
+        clean = t.split(":", 1)[1] if ":" in t else t
+        yahoo_map[yt] = clean
+
+    yahoo_tickers = list(yahoo_map.keys())
+    log.info(f"Fetching quotes for {len(yahoo_tickers)} tickers via Yahoo Finance")
+
+    try:
+        # One call: 1 year of daily OHLCV — gives us 52-week range + 20d avg vol
+        # auto_adjust=True means Close is adjusted for splits/dividends
+        df = yf.download(
+            yahoo_tickers,
+            period="1y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:
+        log.error(f"yfinance download error: {e}")
+        return jsonify({"error": f"Yahoo Finance fetch failed: {str(e)}"}), 502
+
+    if df.empty:
+        return jsonify({"error": "Yahoo Finance returned no data"}), 502
 
     quotes = {}
-    for symbol, q in data.get("data", {}).items():
-        last_price = q.get("last_price")
-        ohlc = q.get("ohlc", {})
-        prev_close = ohlc.get("close")
-        day_high = ohlc.get("high")
-        day_low = ohlc.get("low")
-        change_pct = None
-        if last_price is not None and prev_close:
-            change_pct = round(((last_price - prev_close) / prev_close) * 100, 2)
-        range_pct = None
-        if day_high is not None and day_low is not None and day_high != day_low and last_price is not None:
-            range_pct = round(((last_price - day_low) / (day_high - day_low)) * 100, 1)
-        quotes[symbol] = {
-            "last_price": last_price,
-            "prev_close": prev_close,
-            "change_pct": change_pct,
-            "day_high": day_high,
-            "day_low": day_low,
-            "range_pct": range_pct,
-        }
+
+    # Handle single vs multi-ticker DataFrame structure
+    single = len(yahoo_tickers) == 1
+
+    for yt, original in yahoo_map.items():
+        try:
+            if single:
+                close_series  = df["Close"]
+                high_series   = df["High"]
+                low_series    = df["Low"]
+                volume_series = df["Volume"]
+            else:
+                # MultiIndex: (field, ticker)
+                if yt not in df["Close"].columns:
+                    quotes[original] = None
+                    continue
+                close_series  = df["Close"][yt]
+                high_series   = df["High"][yt]
+                low_series    = df["Low"][yt]
+                volume_series = df["Volume"][yt]
+
+            # Drop NaN rows
+            close_series  = close_series.dropna()
+            high_series   = high_series.dropna()
+            low_series    = low_series.dropna()
+            volume_series = volume_series.dropna()
+
+            if len(close_series) < 2:
+                quotes[original] = None
+                continue
+
+            last_price  = float(close_series.iloc[-1])
+            prev_close  = float(close_series.iloc[-2])
+            day_high    = float(high_series.iloc[-1])
+            day_low     = float(low_series.iloc[-1])
+            today_vol   = int(volume_series.iloc[-1])
+
+            # 20-session average volume (exclude today)
+            vol_history = volume_series.iloc[-21:-1]  # up to 20 sessions before today
+            avg_vol_20d = int(vol_history.mean()) if len(vol_history) >= 5 else None
+
+            rvol = round(today_vol / avg_vol_20d, 2) if avg_vol_20d else None
+
+            change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
+
+            # 52-week range from the full 1-year download
+            week52_high = float(high_series.max())
+            week52_low  = float(low_series.min())
+
+            # Where in today's H-L range does the price sit?
+            range_pct = None
+            if day_high != day_low:
+                range_pct = round(((last_price - day_low) / (day_high - day_low)) * 100, 1)
+
+            quotes[original] = {
+                "last_price":  round(last_price, 2),
+                "prev_close":  round(prev_close, 2),
+                "change_pct":  change_pct,
+                "day_high":    round(day_high, 2),
+                "day_low":     round(day_low, 2),
+                "volume":      today_vol,
+                "avg_vol_20d": avg_vol_20d,
+                "rvol":        rvol,
+                "week52_high": round(week52_high, 2),
+                "week52_low":  round(week52_low, 2),
+                "range_pct":   range_pct,
+            }
+
+        except Exception as e:
+            log.warning(f"Error processing {yt}: {e}")
+            quotes[original] = None
 
     return jsonify({"status": "success", "quotes": quotes})
 
 
-@app.route("/api/news", methods=["GET"])
-def fetch_news_for_company():
-    """
-    Query param: ?company=Aarti+Industries
-
-    Fetches Google News RSS for the given company name directly from this
-    server (no CORS issue, no anonymous-proxy abuse flag) and returns
-    parsed articles as JSON.
-    """
-    company = request.args.get("company", "").strip()
-    if not company:
-        return jsonify({"error": "company query parameter is required"}), 400
-
-    query = quote(f'"{company}" when:3d')
-    rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-
-    try:
-        resp = requests.get(rss_url, headers=NEWS_FETCH_HEADERS, timeout=12)
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Could not reach Google News: {e}"}), 502
-
-    if resp.status_code != 200:
-        return jsonify({
-            "error": f"Google News returned HTTP {resp.status_code}",
-            "raw_response_snippet": resp.text[:300],
-        }), 502
-
-    try:
-        parsed = feedparser.parse(resp.content)
-    except Exception as e:
-        return jsonify({"error": f"Could not parse RSS response: {e}"}), 502
-
-    articles = []
-    for entry in parsed.entries[:5]:
-        raw_title = (entry.get("title") or "").strip()
-        title, source = raw_title, "Google News"
-        sep_idx = raw_title.rfind(" - ")
-        if sep_idx > 0:
-            title = raw_title[:sep_idx].strip()
-            source = raw_title[sep_idx + 3:].strip()
-
-        articles.append({
-            "title": title,
-            "source": source,
-            "url": entry.get("link", ""),
-            "published": entry.get("published", ""),
-        })
-
-    return jsonify({
-        "status": "success",
-        "company": company,
-        "count": len(articles),
-        "articles": articles,
-    })
-
-
-@app.route("/api/kite/exchange", methods=["POST"])
-def exchange_and_fetch_holdings():
-    """
-    Body (JSON): { "request_token": "..." }
-
-    Exchanges the request_token for an access_token (using the secret held
-    only in this server's environment), fetches holdings with that token,
-    and returns the holdings to the caller. The access_token is not
-    returned to the browser.
-    """
-    if not KITE_API_KEY or not KITE_API_SECRET:
-        return jsonify({
-            "error": "Server is missing KITE_API_KEY / KITE_API_SECRET environment variables. "
-                     "Set them in your hosting platform's dashboard, not in code."
-        }), 500
-
-    body = request.get_json(silent=True) or {}
-    request_token = body.get("request_token", "").strip()
-    if not request_token:
-        return jsonify({"error": "request_token is required"}), 400
-
-    # Step 1 — exchange request_token for access_token
-    # checksum = SHA-256(api_key + request_token + api_secret), per Kite's spec
-    checksum = hashlib.sha256(
-        (KITE_API_KEY + request_token + KITE_API_SECRET).encode("utf-8")
-    ).hexdigest()
-
-    try:
-        token_resp = requests.post(
-            KITE_SESSION_TOKEN_URL,
-            headers={"X-Kite-Version": "3"},
-            data={
-                "api_key": KITE_API_KEY,
-                "request_token": request_token,
-                "checksum": checksum,
-            },
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Could not reach Kite to exchange token: {e}"}), 502
-
-    try:
-        token_data = token_resp.json()
-    except ValueError:
-        return jsonify({
-            "error": "Kite returned a response that wasn't valid JSON during token exchange.",
-            "http_status": token_resp.status_code,
-            "raw_response_snippet": token_resp.text[:300],
-        }), 502
-
-    if token_resp.status_code != 200 or token_data.get("status") != "success":
-        return jsonify({
-            "error": "Kite rejected the token exchange.",
-            "kite_response": token_data,
-        }), 400
-
-    access_token = token_data.get("data", {}).get("access_token")
-    if not access_token:
-        return jsonify({
-            "error": "Kite said the exchange succeeded but didn't return an access_token.",
-            "kite_response": token_data,
-        }), 502
-
-    # Cache in memory too, as a same-process fallback (harmless if it works,
-    # irrelevant if Render recycles the process before the next request —
-    # the real reliability now comes from returning the token to the phone
-    # below, which persists correctly in localStorage regardless of which
-    # backend process later handles /api/quotes).
-    _session_cache["access_token"] = access_token
-    _session_cache["set_at"] = time.time()
-
-    # Step 2 — use the access_token immediately to fetch holdings
-    try:
-        holdings_resp = requests.get(
-            KITE_HOLDINGS_URL,
-            headers={
-                "X-Kite-Version": "3",
-                "Authorization": f"token {KITE_API_KEY}:{access_token}",
-            },
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Token exchange succeeded but holdings fetch failed: {e}"}), 502
-
-    try:
-        holdings_data = holdings_resp.json()
-    except ValueError:
-        return jsonify({
-            "error": "Kite returned a response that wasn't valid JSON during holdings fetch.",
-            "http_status": holdings_resp.status_code,
-            "raw_response_snippet": holdings_resp.text[:300],
-        }), 502
-
-    if holdings_resp.status_code != 200 or holdings_data.get("status") != "success":
-        return jsonify({
-            "error": "Logged in successfully, but Kite rejected the holdings request.",
-            "kite_response": holdings_data,
-        }), 400
-
-    holdings = holdings_data.get("data", [])
-
-    # Step 3 — return what the app needs, including the access_token this
-    # time. This is a deliberate, explicit exception to "never send tokens
-    # to the browser" — made because relying on this server's own process
-    # memory to survive between two separate requests turned out to be
-    # unreliable (Render can recycle/restart processes between requests on
-    # the free tier). The api_secret itself is still never sent, logged, or
-    # written anywhere — only this short-lived access_token, which Kite
-    # itself invalidates daily regardless of what this app does with it.
-    simplified = [
-        {
-            "ticker": h.get("tradingsymbol", ""),
-            "exchange": h.get("exchange", ""),
-            "quantity": h.get("quantity", 0),
-            "average_price": h.get("average_price", 0),
-            "last_price": h.get("last_price", 0),
-            "pnl": h.get("pnl", 0),
-        }
-        for h in holdings
-    ]
-
-    return jsonify({
-        "status": "success",
-        "count": len(simplified),
-        "holdings": simplified,
-        "access_token": access_token,
-        "user": {
-            "user_name": token_data["data"].get("user_name", ""),
-            "user_id": token_data["data"].get("user_id", ""),
-        },
-    })
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
