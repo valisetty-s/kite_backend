@@ -129,15 +129,30 @@ def _to_yahoo_symbol(ticker):
 
 
 def _fetch_one_quote(yahoo_symbol):
-    stock = yf.Ticker(yahoo_symbol)
-    info = stock.info  # yfinance's richer dict — includes 52wk range, avg volume
+    """
+    Uses yfinance's `fast_info` rather than the older `.info` dict.
 
-    last_price = info.get("currentPrice") or info.get("regularMarketPrice")
-    prev_close = info.get("previousClose") or info.get("regularMarketPreviousClose")
-    volume = info.get("volume") or info.get("regularMarketVolume")
-    avg_volume_20d = info.get("averageVolume10days") or info.get("averageVolume")
-    fifty_two_wk_low = info.get("fiftyTwoWeekLow")
-    fifty_two_wk_high = info.get("fiftyTwoWeekHigh")
+    Why this matters directly for the bug being fixed: yfinance's own
+    source code (confirmed by reading it directly) lists `currentPrice`,
+    `previousClose`, `volume`, `fiftyTwoWeekLow/High`, and `averageVolume`
+    among "info_retired_keys" — fields that are deprecated in `.info` and
+    can silently return stale, missing, or unexpected values depending on
+    the ticker. `fast_info` instead computes each value explicitly from
+    real daily price history (e.g. `previous_close` is literally
+    "yesterday's close from the actual price series," not a cached
+    snapshot field) — which is exactly the fix needed for a change%
+    that was coming out looking like a 1-year change instead of 1-day.
+    """
+    stock = yf.Ticker(yahoo_symbol)
+    fi = stock.fast_info
+
+    last_price = fi.get("last_price")
+    prev_close = fi.get("previous_close") or fi.get("regular_market_previous_close")
+    volume = fi.get("last_volume")
+    avg_volume_10d = fi.get("ten_day_average_volume")
+    avg_volume_3mo = fi.get("three_month_average_volume")
+    fifty_two_wk_low = fi.get("year_low")
+    fifty_two_wk_high = fi.get("year_high")
 
     if last_price is None:
         raise ValueError("no price data returned (symbol may be wrong, delisted, or unsupported)")
@@ -146,10 +161,15 @@ def _fetch_one_quote(yahoo_symbol):
     if prev_close:
         change_pct = round(((last_price - prev_close) / prev_close) * 100, 2)
 
+    # Prefer the 10-day average for the volume comparison — closer to "is
+    # today unusual" than the 3-month figure, which smooths out too much
+    # to flag a genuinely high/low day. Falls back to the 3-month average
+    # only if the 10-day figure isn't available for some reason.
+    avg_volume = avg_volume_10d or avg_volume_3mo
     volume_vs_avg_pct = None
     volume_flag = None
-    if volume is not None and avg_volume_20d:
-        volume_vs_avg_pct = round((volume / avg_volume_20d) * 100, 1)
+    if volume is not None and avg_volume:
+        volume_vs_avg_pct = round((volume / avg_volume) * 100, 1)
         if volume_vs_avg_pct >= 150:
             volume_flag = "high"
         elif volume_vs_avg_pct <= 50:
@@ -169,7 +189,7 @@ def _fetch_one_quote(yahoo_symbol):
         "prev_close": prev_close,
         "change_pct": change_pct,
         "volume": volume,
-        "avg_volume_20d": avg_volume_20d,
+        "avg_volume_20d": avg_volume,  # key name kept for frontend compatibility; now sourced from fast_info's 10-day (or 3-month fallback) average
         "volume_vs_avg_pct": volume_vs_avg_pct,
         "volume_flag": volume_flag,
         "fifty_two_wk_low": fifty_two_wk_low,
@@ -191,7 +211,7 @@ def fetch_news_for_company():
     if not company:
         return jsonify({"error": "company query parameter is required"}), 400
 
-    query = quote(f'"{company}" when:3d')
+    query = quote(f'"{company}" when:7d')
     rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
 
     try:
