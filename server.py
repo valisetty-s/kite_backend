@@ -132,16 +132,16 @@ def _fetch_one_quote(yahoo_symbol):
     """
     Uses yfinance's `fast_info` rather than the older `.info` dict.
 
-    Why this matters directly for the bug being fixed: yfinance's own
-    source code (confirmed by reading it directly) lists `currentPrice`,
-    `previousClose`, `volume`, `fiftyTwoWeekLow/High`, and `averageVolume`
-    among "info_retired_keys" — fields that are deprecated in `.info` and
-    can silently return stale, missing, or unexpected values depending on
-    the ticker. `fast_info` instead computes each value explicitly from
-    real daily price history (e.g. `previous_close` is literally
-    "yesterday's close from the actual price series," not a cached
-    snapshot field) — which is exactly the fix needed for a change%
-    that was coming out looking like a 1-year change instead of 1-day.
+    Why: yfinance's own source code (confirmed by reading it directly)
+    lists `currentPrice`, `previousClose`, `volume`, `fiftyTwoWeekLow/High`,
+    and `averageVolume` among "info_retired_keys" — fields deprecated in
+    `.info` that can silently return stale, missing, or unexpected values
+    depending on the ticker. This is what caused the originally-reported
+    bug: change% was coming out looking like roughly a 1-year change
+    instead of a 1-day change. `fast_info` computes each value explicitly
+    from real daily price history instead (e.g. `previous_close` is
+    literally "yesterday's close from the actual price series"), which
+    removes that ambiguity at the root.
     """
     stock = yf.Ticker(yahoo_symbol)
     fi = stock.fast_info
@@ -189,7 +189,7 @@ def _fetch_one_quote(yahoo_symbol):
         "prev_close": prev_close,
         "change_pct": change_pct,
         "volume": volume,
-        "avg_volume_20d": avg_volume,  # key name kept for frontend compatibility; now sourced from fast_info's 10-day (or 3-month fallback) average
+        "avg_volume_20d": avg_volume,  # key name kept for frontend compatibility
         "volume_vs_avg_pct": volume_vs_avg_pct,
         "volume_flag": volume_flag,
         "fifty_two_wk_low": fifty_two_wk_low,
