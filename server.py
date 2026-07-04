@@ -130,14 +130,14 @@ def _to_yahoo_symbol(ticker):
 
 def _fetch_one_quote(yahoo_symbol):
     """
-    Fetches current price and compares to YESTERDAY's close for accurate
-    day-over-day change percentage. Uses 3-month range to ensure we get reliable
-    20-day average volume data. Also retrieves 52-week high/low and volume
-    metrics from Yahoo Finance.
+    Fetches current price and calculates day-over-day change by finding the
+    nearest available previous close (yesterday, 2 days ago, etc). Falls back
+    progressively if data is missing. Uses 3-month range for reliable volume
+    averages and 52-week data.
     """
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yahoo_symbol
     hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
-    # Use 3mo range to get reliable 20-day average volume, includes recent price data
+    # Use 3mo range to get reliable 20-day average volume and historical close data
     r = requests.get(url, headers=hdrs,
                      params={"range": "3mo", "interval": "1d", "includePrePost": "false"}, timeout=12)
     if r.status_code != 200:
@@ -156,14 +156,18 @@ def _fetch_one_quote(yahoo_symbol):
     if last_price is None:
         raise ValueError(f"No price for {yahoo_symbol}")
     
-    # Get previous close from the quote data array (actual yesterday's close)
-    # The quote array contains [today, yesterday, day-before, etc.]
-    closes = [c for c in (q.get("close") or []) if c is not None]
+    # Get all closes from quote array, preserving order
+    # Array is in reverse chronological order: [most recent, ..., oldest]
+    # Extract the first non-None previous close (1-5 days back depending on availability)
+    raw_closes = q.get("close") or []
     prev_close = None
-    if len(closes) >= 2:
-        # closes[0] is today, closes[1] is yesterday
-        prev_close = closes[1]
-    # If we can't get yesterday's close, leave as None (will show as N/A)
+    
+    # Try to find a valid previous close, checking up to 5 days back
+    # This handles weekends, holidays, and missing data gracefully
+    for i in range(1, min(6, len(raw_closes))):
+        if raw_closes[i] is not None and raw_closes[i] != 0:
+            prev_close = raw_closes[i]
+            break
     
     change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
     
