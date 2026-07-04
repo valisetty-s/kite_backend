@@ -130,16 +130,16 @@ def _to_yahoo_symbol(ticker):
 
 def _fetch_one_quote(yahoo_symbol):
     """
-    BUG FIX: yfinance fast_info.get("previous_close") always returned None
-    (FastInfo is not a dict). change_pct was computed against wrong baseline,
-    appearing as a ~1-year change. Now reads meta.regularMarketPrice and
-    meta.previousClose directly from Yahoo chart API - guaranteed day-over-day.
-    Also removes yfinance/pandas — no compiled dependencies, works on Python 3.14.
+    Fetches current price and compares to YESTERDAY's close for accurate
+    day-over-day change percentage. Uses 3-month range to ensure we get reliable
+    20-day average volume data. Also retrieves 52-week high/low and volume
+    metrics from Yahoo Finance.
     """
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yahoo_symbol
     hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
+    # Use 3mo range to get reliable 20-day average volume, includes recent price data
     r = requests.get(url, headers=hdrs,
-                     params={"range": "1y", "interval": "1d", "includePrePost": "false"}, timeout=12)
+                     params={"range": "3mo", "interval": "1d", "includePrePost": "false"}, timeout=12)
     if r.status_code != 200:
         raise ValueError(f"Yahoo HTTP {r.status_code} for {yahoo_symbol}")
     d = r.json()
@@ -149,13 +149,25 @@ def _fetch_one_quote(yahoo_symbol):
     meta = result.get("meta", {})
     q    = (result.get("indicators", {}).get("quote") or [{}])[0]
     last_price = meta.get("regularMarketPrice")
-    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
     today_vol  = meta.get("regularMarketVolume")
     wk52_high  = meta.get("fiftyTwoWeekHigh")
     wk52_low   = meta.get("fiftyTwoWeekLow")
+    
     if last_price is None:
         raise ValueError(f"No price for {yahoo_symbol}")
+    
+    # Get previous close from the quote data array (actual yesterday's close)
+    # The quote array contains [today, yesterday, day-before, etc.]
+    closes = [c for c in (q.get("close") or []) if c is not None]
+    prev_close = None
+    if len(closes) >= 2:
+        # closes[0] is today, closes[1] is yesterday
+        prev_close = closes[1]
+    # If we can't get yesterday's close, leave as None (will show as N/A)
+    
     change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
+    
+    # Get volume data for volume comparison
     vol_series  = [v for v in (q.get("volume") or []) if v is not None]
     last_20     = vol_series[:-1][-20:]
     avg_vol_20d = int(sum(last_20) / len(last_20)) if len(last_20) >= 5 else None
@@ -163,6 +175,7 @@ def _fetch_one_quote(yahoo_symbol):
     if today_vol and avg_vol_20d:
         volume_vs_avg_pct = round((today_vol / avg_vol_20d) * 100, 1)
         volume_flag = "high" if volume_vs_avg_pct >= 150 else ("low" if volume_vs_avg_pct <= 50 else None)
+    
     near_52wk_flag = None
     if wk52_high and wk52_low and last_price:
         near_52wk_flag = ("near-high" if last_price >= wk52_high * 0.98
