@@ -152,7 +152,7 @@ def fetch_quotes():
     
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def _do_fetch(raw):
+    def _do_fetch(raw):
         try:
             yahoo_symbol = _to_yahoo_symbol(raw)
             logger.debug(f"{raw} - Trying: {yahoo_symbol}")
