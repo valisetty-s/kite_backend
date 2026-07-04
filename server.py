@@ -282,29 +282,43 @@ def _fetch_one_quote(yahoo_symbol):
             logger.error(f"{yahoo_symbol} - No price found")
             raise ValueError(f"No price for {yahoo_symbol}")
         
-        # Use timestamps to find the most recent complete day and the previous trading day
-        # Timestamps are Unix epoch, most recent first in the array
+        # Use timestamps to find the most recent complete day and the previous trading day.
+        #
+        # IMPORTANT: Yahoo's chart API returns the close/timestamp arrays in
+        # ASCENDING order — oldest data point first, most recent last.
+        # Confirmed directly against multiple independent examples of the
+        # same endpoint (e.g. a 1-year AAPL request starts with a January
+        # timestamp and increases from there). The previous version of this
+        # function scanned from index 0 forward assuming the opposite
+        # (newest-first), which meant "previous close" was actually being
+        # read from near the START of the 3-month window — a price from
+        # ~3 months ago, not yesterday. That's exactly what produced a
+        # change% that looked like a multi-month/yearly move instead of a
+        # single day's move. Fixed by scanning from the END of the array
+        # backward instead.
         raw_closes = q.get("close") or []
         prev_close = None
-        prev_close_day_offset = None
-        
-        logger.debug(f"{yahoo_symbol} - First 5 closes: {raw_closes[:5]}, First 5 timestamps: {timestamps[:5]}")
-        
-        # Array is sorted most recent to oldest. Find first valid close (not None, not 0)
-        # Then keep searching for the second valid close - that's yesterday's
+        prev_close_index_from_end = None
+
+        logger.debug(f"{yahoo_symbol} - Last 5 closes: {raw_closes[-5:]}, Last 5 timestamps: {timestamps[-5:]}")
+
         valid_closes_found = 0
-        for i in range(len(raw_closes)):
+        for i in range(len(raw_closes) - 1, -1, -1):
             if raw_closes[i] is not None and raw_closes[i] != 0:
                 valid_closes_found += 1
-                if valid_closes_found == 2:  # We want the SECOND valid close (previous trading day)
+                # The FIRST valid close found scanning backward is today's
+                # (or the most recent trading day's) close. The SECOND
+                # valid close found is the previous trading day — the one
+                # we actually want for a 1-day change.
+                if valid_closes_found == 2:
                     prev_close = raw_closes[i]
-                    prev_close_day_offset = i
+                    prev_close_index_from_end = len(raw_closes) - 1 - i
                     break
-        
+
         if prev_close is None:
             logger.warning(f"{yahoo_symbol} - Could not find valid previous close")
         else:
-            logger.debug(f"{yahoo_symbol} - Using previous close: {prev_close} (from {prev_close_day_offset} days back)")
+            logger.debug(f"{yahoo_symbol} - Using previous close: {prev_close} ({prev_close_index_from_end} trading days back)")
         
         change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
         logger.info(f"{yahoo_symbol} - Change %: {change_pct} (current: {last_price}, prev: {prev_close})")
