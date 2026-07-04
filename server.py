@@ -152,14 +152,28 @@ def fetch_quotes():
     
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    def _do_fetch(raw):
+def _do_fetch(raw):
         try:
-            result = raw, _fetch_one_quote(_to_yahoo_symbol(raw))
-            logger.debug(f"Successfully fetched {raw}")
+            yahoo_symbol = _to_yahoo_symbol(raw)
+            logger.debug(f"{raw} - Trying: {yahoo_symbol}")
+            result = raw, _fetch_one_quote(yahoo_symbol)
+            logger.debug(f"Successfully fetched {raw} as {yahoo_symbol}")
             return result
         except Exception as e:
-            logger.error(f"Failed to fetch {raw}: {str(e)}")
-            return raw, {"error": str(e)}
+            # If NSE (.NS) failed, try BSE (.BO) as fallback
+            if ".NS" in str(e) and "-BE" not in raw and "-BO" not in raw:
+                try:
+                    yahoo_symbol_bse = _to_yahoo_symbol_bse(raw)
+                    logger.debug(f"{raw} - NSE failed, trying BSE: {yahoo_symbol_bse}")
+                    result = raw, _fetch_one_quote(yahoo_symbol_bse)
+                    logger.debug(f"Successfully fetched {raw} as {yahoo_symbol_bse} (BSE fallback)")
+                    return result
+                except Exception as e2:
+                    logger.error(f"Failed to fetch {raw} on both NSE and BSE: {str(e2)}")
+                    return raw, {"error": f"{str(e)} / BSE also failed: {str(e2)}"}
+            else:
+                logger.error(f"Failed to fetch {raw}: {str(e)}")
+                return raw, {"error": str(e)}
 
     quotes = {}
     failed_count = 0
@@ -182,17 +196,48 @@ def fetch_quotes():
 def _to_yahoo_symbol(ticker):
     """
     Yahoo Finance needs an exchange suffix: .NS for NSE, .BO for BSE.
-    Tickers from Kite holdings don't carry that suffix at all, so this
-    defaults to NSE (.NS) — correct for the large majority of a typical
-    portfolio. A ticker that's genuinely BSE-only and not cross-listed on
-    NSE will come back as a per-symbol error from _fetch_one_quote below,
-    handled the same soft-fail way as any other lookup miss — not a crash,
-    just "no price available for this one."
+    This function:
+    1. Removes any existing -BE, -BO, -EQ suffixes (Kite indicators)
+    2. Removes any existing .NS, .BO suffixes (if already present)
+    3. Defaults to .NS (NSE — correct for most Indian stocks)
+    
+    A ticker that's genuinely BSE-only and not cross-listed on NSE will
+    come back as a per-symbol error from _fetch_one_quote below, handled
+    as a soft-fail — just "no price available for this one."
     """
     ticker = ticker.strip().upper()
+    
+    # Remove exchange suffixes if they exist
+    # These come from Kite exports: SYMBOL-BE, SYMBOL-BO, SYMBOL-EQ, etc.
+    ticker = ticker.replace("-BE", "").replace("-BO", "").replace("-EQ", "")
+    
+    # If already has an exchange suffix, return as-is
     if ticker.endswith(".NS") or ticker.endswith(".BO"):
         return ticker
+    
+    # Default to NSE (most stocks are listed here)
     return f"{ticker}.NS"
+
+
+def _to_yahoo_symbol_bse(ticker):
+    """
+    Same as _to_yahoo_symbol but tries BSE (.BO) instead of NSE (.NS).
+    Used as fallback if NSE lookup fails.
+    """
+    ticker = ticker.strip().upper()
+    
+    # Remove exchange suffixes if they exist
+    ticker = ticker.replace("-BE", "").replace("-BO", "").replace("-EQ", "")
+    
+    # If already has an exchange suffix and it's .BO, return as-is
+    if ticker.endswith(".BO"):
+        return ticker
+    
+    # Remove .NS if present, then add .BO
+    ticker = ticker.replace(".NS", "")
+    
+    # Try BSE
+    return f"{ticker}.BO"
 
 
 def _fetch_one_quote(yahoo_symbol):
