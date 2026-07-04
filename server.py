@@ -45,7 +45,6 @@ from urllib.parse import quote
 
 import feedparser
 import requests
-import yfinance as yf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -97,17 +96,18 @@ def fetch_quotes():
     if not raw_symbols:
         return jsonify({"error": "no valid symbols provided"}), 400
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _do_fetch(raw):
+        try: return raw, _fetch_one_quote(_to_yahoo_symbol(raw))
+        except Exception as e: return raw, {"error": str(e)}
+
     quotes = {}
-    for raw_symbol in raw_symbols:
-        yahoo_symbol = _to_yahoo_symbol(raw_symbol)
-        try:
-            quotes[raw_symbol] = _fetch_one_quote(yahoo_symbol)
-        except Exception as e:
-            # Fail soft, per-symbol — one bad/delisted/mistyped ticker must
-            # never break the whole batch. The frontend already treats a
-            # missing entry as "no price available for this one," same as
-            # it did for Kite's own documented missing-symbol behavior.
-            quotes[raw_symbol] = {"error": str(e)}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_do_fetch, s): s for s in raw_symbols}
+        for future in as_completed(futures):
+            sym, res = future.result()
+            quotes[sym] = res
 
     return jsonify({"status": "success", "quotes": quotes})
 
@@ -130,73 +130,52 @@ def _to_yahoo_symbol(ticker):
 
 def _fetch_one_quote(yahoo_symbol):
     """
-    Uses yfinance's `fast_info` rather than the older `.info` dict.
-
-    Why: yfinance's own source code (confirmed by reading it directly)
-    lists `currentPrice`, `previousClose`, `volume`, `fiftyTwoWeekLow/High`,
-    and `averageVolume` among "info_retired_keys" — fields deprecated in
-    `.info` that can silently return stale, missing, or unexpected values
-    depending on the ticker. This is what caused the originally-reported
-    bug: change% was coming out looking like roughly a 1-year change
-    instead of a 1-day change. `fast_info` computes each value explicitly
-    from real daily price history instead (e.g. `previous_close` is
-    literally "yesterday's close from the actual price series"), which
-    removes that ambiguity at the root.
+    BUG FIX: yfinance fast_info.get("previous_close") always returned None
+    (FastInfo is not a dict). change_pct was computed against wrong baseline,
+    appearing as a ~1-year change. Now reads meta.regularMarketPrice and
+    meta.previousClose directly from Yahoo chart API - guaranteed day-over-day.
+    Also removes yfinance/pandas — no compiled dependencies, works on Python 3.14.
     """
-    stock = yf.Ticker(yahoo_symbol)
-    fi = stock.fast_info
-
-    last_price = fi.get("last_price")
-    prev_close = fi.get("previous_close") or fi.get("regular_market_previous_close")
-    volume = fi.get("last_volume")
-    avg_volume_10d = fi.get("ten_day_average_volume")
-    avg_volume_3mo = fi.get("three_month_average_volume")
-    fifty_two_wk_low = fi.get("year_low")
-    fifty_two_wk_high = fi.get("year_high")
-
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yahoo_symbol
+    hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
+    r = requests.get(url, headers=hdrs,
+                     params={"range": "1y", "interval": "1d", "includePrePost": "false"}, timeout=12)
+    if r.status_code != 200:
+        raise ValueError(f"Yahoo HTTP {r.status_code} for {yahoo_symbol}")
+    d = r.json()
+    result = (d.get("chart", {}).get("result") or [None])[0]
+    if not result:
+        raise ValueError(f"No chart data for {yahoo_symbol}")
+    meta = result.get("meta", {})
+    q    = (result.get("indicators", {}).get("quote") or [{}])[0]
+    last_price = meta.get("regularMarketPrice")
+    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+    today_vol  = meta.get("regularMarketVolume")
+    wk52_high  = meta.get("fiftyTwoWeekHigh")
+    wk52_low   = meta.get("fiftyTwoWeekLow")
     if last_price is None:
-        raise ValueError("no price data returned (symbol may be wrong, delisted, or unsupported)")
-
-    change_pct = None
-    if prev_close:
-        change_pct = round(((last_price - prev_close) / prev_close) * 100, 2)
-
-    # Prefer the 10-day average for the volume comparison — closer to "is
-    # today unusual" than the 3-month figure, which smooths out too much
-    # to flag a genuinely high/low day. Falls back to the 3-month average
-    # only if the 10-day figure isn't available for some reason.
-    avg_volume = avg_volume_10d or avg_volume_3mo
-    volume_vs_avg_pct = None
-    volume_flag = None
-    if volume is not None and avg_volume:
-        volume_vs_avg_pct = round((volume / avg_volume) * 100, 1)
-        if volume_vs_avg_pct >= 150:
-            volume_flag = "high"
-        elif volume_vs_avg_pct <= 50:
-            volume_flag = "low"
-
+        raise ValueError(f"No price for {yahoo_symbol}")
+    change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
+    vol_series  = [v for v in (q.get("volume") or []) if v is not None]
+    last_20     = vol_series[:-1][-20:]
+    avg_vol_20d = int(sum(last_20) / len(last_20)) if len(last_20) >= 5 else None
+    volume_vs_avg_pct = volume_flag = None
+    if today_vol and avg_vol_20d:
+        volume_vs_avg_pct = round((today_vol / avg_vol_20d) * 100, 1)
+        volume_flag = "high" if volume_vs_avg_pct >= 150 else ("low" if volume_vs_avg_pct <= 50 else None)
     near_52wk_flag = None
-    if fifty_two_wk_low and fifty_two_wk_high and last_price:
-        # Within 2% of the 52-week high or low counts as "near" — a simple,
-        # fixed threshold rather than anything more elaborate.
-        if last_price >= fifty_two_wk_high * 0.98:
-            near_52wk_flag = "near-high"
-        elif last_price <= fifty_two_wk_low * 1.02:
-            near_52wk_flag = "near-low"
-
+    if wk52_high and wk52_low and last_price:
+        near_52wk_flag = ("near-high" if last_price >= wk52_high * 0.98
+                          else "near-low" if last_price <= wk52_low * 1.02 else None)
     return {
-        "last_price": last_price,
-        "prev_close": prev_close,
-        "change_pct": change_pct,
-        "volume": volume,
-        "avg_volume_20d": avg_volume,  # key name kept for frontend compatibility
-        "volume_vs_avg_pct": volume_vs_avg_pct,
+        "last_price": round(last_price, 2), "prev_close": round(prev_close, 2) if prev_close else None,
+        "change_pct": change_pct, "volume": int(today_vol) if today_vol else None,
+        "avg_volume_20d": avg_vol_20d, "volume_vs_avg_pct": volume_vs_avg_pct,
         "volume_flag": volume_flag,
-        "fifty_two_wk_low": fifty_two_wk_low,
-        "fifty_two_wk_high": fifty_two_wk_high,
+        "fifty_two_wk_low": round(wk52_low, 2) if wk52_low else None,
+        "fifty_two_wk_high": round(wk52_high, 2) if wk52_high else None,
         "near_52wk_flag": near_52wk_flag,
     }
-
 
 @app.route("/api/news", methods=["GET"])
 def fetch_news_for_company():
