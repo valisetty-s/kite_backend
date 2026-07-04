@@ -41,15 +41,34 @@ secrets are logged.
 
 import hashlib
 import os
+import logging
+import sys
 from urllib.parse import quote
+from datetime import datetime
 
 import feedparser
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+# Configure comprehensive logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/tmp/morning-ledger.log', mode='a')
+    ]
+)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 CORS(app)  # Allow the PWA (hosted on a different domain) to call this API
+
+logger.info("=" * 80)
+logger.info("Morning Ledger Backend Starting")
+logger.info(f"Timestamp: {datetime.now()}")
+logger.info("=" * 80)
 
 KITE_API_KEY = os.environ.get("KITE_API_KEY", "")
 KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
@@ -68,7 +87,35 @@ NEWS_FETCH_HEADERS = {
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
+    logger.info("Health check")
     return jsonify({"status": "ok"})
+
+
+@app.route("/logs", methods=["GET"])
+def get_logs():
+    """
+    Returns recent logs for debugging. Shows last 200 lines or specific tail count.
+    Query param: ?tail=100 (default 200)
+    """
+    try:
+        tail = int(request.args.get("tail", 200))
+        with open('/tmp/morning-ledger.log', 'r') as f:
+            lines = f.readlines()
+        recent_lines = lines[-tail:] if len(lines) > tail else lines
+        return jsonify({
+            "status": "ok",
+            "total_lines": len(lines),
+            "returned_lines": len(recent_lines),
+            "logs": ''.join(recent_lines)
+        })
+    except FileNotFoundError:
+        return jsonify({
+            "status": "ok",
+            "message": "Log file not yet created (app just started)"
+        })
+    except Exception as e:
+        logger.error(f"Error reading logs: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/quotes", methods=["GET"])
@@ -88,27 +135,47 @@ def fetch_quotes():
     struggled) to pass a Kite access_token through to a paid endpoint
     Kite never actually granted access to in the first place.
     """
+    logger.info("=== FETCH_QUOTES START ===")
     symbols_param = request.args.get("symbols", "").strip()
+    logger.info(f"Requested symbols: {symbols_param}")
+    
     if not symbols_param:
+        logger.error("No symbols provided")
         return jsonify({"error": "symbols query parameter is required, comma-separated"}), 400
 
     raw_symbols = [s.strip() for s in symbols_param.split(",") if s.strip()]
     if not raw_symbols:
+        logger.error("No valid symbols after parsing")
         return jsonify({"error": "no valid symbols provided"}), 400
 
+    logger.info(f"Parsed {len(raw_symbols)} symbols: {raw_symbols}")
+    
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _do_fetch(raw):
-        try: return raw, _fetch_one_quote(_to_yahoo_symbol(raw))
-        except Exception as e: return raw, {"error": str(e)}
+        try:
+            result = raw, _fetch_one_quote(_to_yahoo_symbol(raw))
+            logger.debug(f"Successfully fetched {raw}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to fetch {raw}: {str(e)}")
+            return raw, {"error": str(e)}
 
     quotes = {}
+    failed_count = 0
+    success_count = 0
+    
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(_do_fetch, s): s for s in raw_symbols}
         for future in as_completed(futures):
             sym, res = future.result()
             quotes[sym] = res
+            if "error" in res:
+                failed_count += 1
+            else:
+                success_count += 1
 
+    logger.info(f"=== FETCH_QUOTES END === Success: {success_count}/{len(raw_symbols)}, Failed: {failed_count}")
     return jsonify({"status": "success", "quotes": quotes})
 
 
@@ -130,69 +197,103 @@ def _to_yahoo_symbol(ticker):
 
 def _fetch_one_quote(yahoo_symbol):
     """
-    Fetches current price and calculates day-over-day change by finding the
-    nearest available previous close (yesterday, 2 days ago, etc). Falls back
-    progressively if data is missing. Uses 3-month range for reliable volume
-    averages and 52-week data.
+    Fetches current price and calculates day-over-day change by using timestamp
+    data to properly identify the previous trading day (handles weekends/holidays).
+    Uses 3-month range for reliable volume averages and 52-week data.
     """
+    logger.info(f"Fetching quote for: {yahoo_symbol}")
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yahoo_symbol
     hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
-    # Use 3mo range to get reliable 20-day average volume and historical close data
-    r = requests.get(url, headers=hdrs,
-                     params={"range": "3mo", "interval": "1d", "includePrePost": "false"}, timeout=12)
-    if r.status_code != 200:
-        raise ValueError(f"Yahoo HTTP {r.status_code} for {yahoo_symbol}")
-    d = r.json()
-    result = (d.get("chart", {}).get("result") or [None])[0]
-    if not result:
-        raise ValueError(f"No chart data for {yahoo_symbol}")
-    meta = result.get("meta", {})
-    q    = (result.get("indicators", {}).get("quote") or [{}])[0]
-    last_price = meta.get("regularMarketPrice")
-    today_vol  = meta.get("regularMarketVolume")
-    wk52_high  = meta.get("fiftyTwoWeekHigh")
-    wk52_low   = meta.get("fiftyTwoWeekLow")
     
-    if last_price is None:
-        raise ValueError(f"No price for {yahoo_symbol}")
-    
-    # Get all closes from quote array, preserving order
-    # Array is in reverse chronological order: [most recent, ..., oldest]
-    # Extract the first non-None previous close (1-5 days back depending on availability)
-    raw_closes = q.get("close") or []
-    prev_close = None
-    
-    # Try to find a valid previous close, checking up to 5 days back
-    # This handles weekends, holidays, and missing data gracefully
-    for i in range(1, min(6, len(raw_closes))):
-        if raw_closes[i] is not None and raw_closes[i] != 0:
-            prev_close = raw_closes[i]
-            break
-    
-    change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
-    
-    # Get volume data for volume comparison
-    vol_series  = [v for v in (q.get("volume") or []) if v is not None]
-    last_20     = vol_series[:-1][-20:]
-    avg_vol_20d = int(sum(last_20) / len(last_20)) if len(last_20) >= 5 else None
-    volume_vs_avg_pct = volume_flag = None
-    if today_vol and avg_vol_20d:
-        volume_vs_avg_pct = round((today_vol / avg_vol_20d) * 100, 1)
-        volume_flag = "high" if volume_vs_avg_pct >= 150 else ("low" if volume_vs_avg_pct <= 50 else None)
-    
-    near_52wk_flag = None
-    if wk52_high and wk52_low and last_price:
-        near_52wk_flag = ("near-high" if last_price >= wk52_high * 0.98
-                          else "near-low" if last_price <= wk52_low * 1.02 else None)
-    return {
-        "last_price": round(last_price, 2), "prev_close": round(prev_close, 2) if prev_close else None,
-        "change_pct": change_pct, "volume": int(today_vol) if today_vol else None,
-        "avg_volume_20d": avg_vol_20d, "volume_vs_avg_pct": volume_vs_avg_pct,
-        "volume_flag": volume_flag,
-        "fifty_two_wk_low": round(wk52_low, 2) if wk52_low else None,
-        "fifty_two_wk_high": round(wk52_high, 2) if wk52_high else None,
-        "near_52wk_flag": near_52wk_flag,
-    }
+    try:
+        # Use 3mo range to get reliable 20-day average volume and historical close data
+        r = requests.get(url, headers=hdrs,
+                         params={"range": "3mo", "interval": "1d", "includePrePost": "false"}, timeout=12)
+        logger.debug(f"{yahoo_symbol} - Response status: {r.status_code}")
+        
+        if r.status_code != 200:
+            logger.error(f"{yahoo_symbol} - Yahoo HTTP {r.status_code}")
+            raise ValueError(f"Yahoo HTTP {r.status_code} for {yahoo_symbol}")
+        
+        d = r.json()
+        result = (d.get("chart", {}).get("result") or [None])[0]
+        if not result:
+            logger.error(f"{yahoo_symbol} - No chart data found")
+            raise ValueError(f"No chart data for {yahoo_symbol}")
+        
+        meta = result.get("meta", {})
+        q    = (result.get("indicators", {}).get("quote") or [{}])[0]
+        timestamps = result.get("timestamp") or []
+        
+        last_price = meta.get("regularMarketPrice")
+        today_vol  = meta.get("regularMarketVolume")
+        wk52_high  = meta.get("fiftyTwoWeekHigh")
+        wk52_low   = meta.get("fiftyTwoWeekLow")
+        
+        logger.debug(f"{yahoo_symbol} - Current price: {last_price}, Volume: {today_vol}")
+        logger.debug(f"{yahoo_symbol} - Timestamps available: {len(timestamps)}, Data points: {len(q.get('close', []))}")
+        
+        if last_price is None:
+            logger.error(f"{yahoo_symbol} - No price found")
+            raise ValueError(f"No price for {yahoo_symbol}")
+        
+        # Use timestamps to find the most recent complete day and the previous trading day
+        # Timestamps are Unix epoch, most recent first in the array
+        raw_closes = q.get("close") or []
+        prev_close = None
+        prev_close_day_offset = None
+        
+        logger.debug(f"{yahoo_symbol} - First 5 closes: {raw_closes[:5]}, First 5 timestamps: {timestamps[:5]}")
+        
+        # Array is sorted most recent to oldest. Find first valid close (not None, not 0)
+        # Then keep searching for the second valid close - that's yesterday's
+        valid_closes_found = 0
+        for i in range(len(raw_closes)):
+            if raw_closes[i] is not None and raw_closes[i] != 0:
+                valid_closes_found += 1
+                if valid_closes_found == 2:  # We want the SECOND valid close (previous trading day)
+                    prev_close = raw_closes[i]
+                    prev_close_day_offset = i
+                    break
+        
+        if prev_close is None:
+            logger.warning(f"{yahoo_symbol} - Could not find valid previous close")
+        else:
+            logger.debug(f"{yahoo_symbol} - Using previous close: {prev_close} (from {prev_close_day_offset} days back)")
+        
+        change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
+        logger.info(f"{yahoo_symbol} - Change %: {change_pct} (current: {last_price}, prev: {prev_close})")
+        
+        # Get volume data for volume comparison
+        vol_series  = [v for v in (q.get("volume") or []) if v is not None]
+        last_20     = vol_series[:-1][-20:]
+        avg_vol_20d = int(sum(last_20) / len(last_20)) if len(last_20) >= 5 else None
+        volume_vs_avg_pct = volume_flag = None
+        if today_vol and avg_vol_20d:
+            volume_vs_avg_pct = round((today_vol / avg_vol_20d) * 100, 1)
+            volume_flag = "high" if volume_vs_avg_pct >= 150 else ("low" if volume_vs_avg_pct <= 50 else None)
+            logger.debug(f"{yahoo_symbol} - Volume vs avg: {volume_vs_avg_pct}%, flag: {volume_flag}")
+        
+        near_52wk_flag = None
+        if wk52_high and wk52_low and last_price:
+            near_52wk_flag = ("near-high" if last_price >= wk52_high * 0.98
+                              else "near-low" if last_price <= wk52_low * 1.02 else None)
+        
+        result_obj = {
+            "last_price": round(last_price, 2), "prev_close": round(prev_close, 2) if prev_close else None,
+            "change_pct": change_pct, "volume": int(today_vol) if today_vol else None,
+            "avg_volume_20d": avg_vol_20d, "volume_vs_avg_pct": volume_vs_avg_pct,
+            "volume_flag": volume_flag,
+            "fifty_two_wk_low": round(wk52_low, 2) if wk52_low else None,
+            "fifty_two_wk_high": round(wk52_high, 2) if wk52_high else None,
+            "near_52wk_flag": near_52wk_flag,
+        }
+        logger.info(f"{yahoo_symbol} - Success: {result_obj}")
+        return result_obj
+        
+    except Exception as e:
+        logger.error(f"{yahoo_symbol} - Exception: {str(e)}", exc_info=True)
+        raise
 
 @app.route("/api/news", methods=["GET"])
 def fetch_news_for_company():
@@ -204,18 +305,25 @@ def fetch_news_for_company():
     parsed articles as JSON.
     """
     company = request.args.get("company", "").strip()
+    logger.info(f"Fetching news for: {company}")
+    
     if not company:
+        logger.error("No company parameter provided")
         return jsonify({"error": "company query parameter is required"}), 400
 
     query = quote(f'"{company}" when:7d')
     rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    logger.debug(f"RSS URL: {rss_url}")
 
     try:
         resp = requests.get(rss_url, headers=NEWS_FETCH_HEADERS, timeout=12)
+        logger.debug(f"{company} - News fetch HTTP status: {resp.status_code}")
     except requests.exceptions.RequestException as e:
+        logger.error(f"{company} - Could not reach Google News: {str(e)}")
         return jsonify({"error": f"Could not reach Google News: {e}"}), 502
 
     if resp.status_code != 200:
+        logger.error(f"{company} - Google News returned HTTP {resp.status_code}")
         return jsonify({
             "error": f"Google News returned HTTP {resp.status_code}",
             "raw_response_snippet": resp.text[:300],
@@ -224,6 +332,7 @@ def fetch_news_for_company():
     try:
         parsed = feedparser.parse(resp.content)
     except Exception as e:
+        logger.error(f"{company} - Could not parse RSS: {str(e)}")
         return jsonify({"error": f"Could not parse RSS response: {e}"}), 502
 
     articles = []
@@ -242,6 +351,7 @@ def fetch_news_for_company():
             "published": entry.get("published", ""),
         })
 
+    logger.info(f"{company} - Found {len(articles)} articles")
     return jsonify({
         "status": "success",
         "company": company,
