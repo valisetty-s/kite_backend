@@ -349,7 +349,7 @@ def fetch_news_for_company():
     server (no CORS issue, no anonymous-proxy abuse flag) and returns
     parsed articles as JSON.
     """
-    company = request.args.get("company", "").strip()
+    company = request.args.get("company", "").strip().removesuffix("-BE")
     logger.info(f"Fetching news for: {company}")
     
     if not company:
