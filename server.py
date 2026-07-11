@@ -118,6 +118,68 @@ def get_logs():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/fundamentals", methods=["GET"])
+def fetch_fundamentals():
+    """
+    Query param: ?symbol=AARTIIND  (single stock only — see why below)
+
+    Returns PE (trailing + forward), P/B, PEG, ROE, and debt-to-equity.
+
+    WHY THIS IS A SEPARATE, SINGLE-SYMBOL ENDPOINT rather than being
+    bundled into /api/quotes for the whole portfolio at once: it uses
+    yfinance's `.info` (not `fast_info`), which fetches a much larger
+    payload per stock and is noticeably slower. Bundling this into the
+    ~96-stock bulk price fetch would meaningfully slow down every single
+    "Fetch latest prices" tap, for data that's only useful when you're
+    actually looking at one stock's fundamentals — so it's fetched on
+    demand instead, one stock at a time.
+
+    WHAT'S DELIBERATELY NOT HERE: ROCE (Return on Capital Employed) is
+    not returned because it isn't available from Yahoo Finance / yfinance
+    at all, for any stock — confirmed directly, not assumed. It's not a
+    standard field in Western financial data feeds; Indian sites like
+    Screener.in compute it themselves from raw financial statements. This
+    endpoint won't fabricate a number for it.
+
+    A CAVEAT ON PEG SPECIFICALLY: there's a documented, known yfinance
+    issue (GitHub #903) where pegRatio can return wildly incorrect values
+    for some tickers, for reasons not fully understood even by yfinance's
+    own maintainers. It's still returned here since it's often correct,
+    but the frontend shows it with a visibly different treatment so it's
+    not mistaken for as-reliable as the others.
+    """
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"error": "symbol query parameter is required"}), 400
+
+    yahoo_symbol = _to_yahoo_symbol(symbol)
+    try:
+        stock = yf.Ticker(yahoo_symbol)
+        info = stock.info
+    except Exception as e:
+        return jsonify({"error": f"Could not fetch fundamentals: {e}"}), 502
+
+    if not info or info.get("trailingPE") is None and info.get("regularMarketPrice") is None:
+        # yfinance sometimes returns a near-empty dict for an unrecognized
+        # or delisted symbol rather than raising — treat that as "no data"
+        # explicitly rather than returning a payload of nulls silently.
+        return jsonify({"error": f"No fundamentals data found for {yahoo_symbol} — check the symbol is correct"}), 404
+
+    return jsonify({
+        "status": "success",
+        "symbol": symbol,
+        "fundamentals": {
+            "trailing_pe": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "price_to_book": info.get("priceToBook"),
+            "peg_ratio": info.get("trailingPegRatio") or info.get("pegRatio"),
+            "return_on_equity": info.get("returnOnEquity"),
+            "debt_to_equity": info.get("debtToEquity"),
+            "profit_margin": info.get("profitMargins"),
+        },
+    })
+
+
 @app.route("/api/quotes", methods=["GET"])
 def fetch_quotes():
     """
