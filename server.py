@@ -43,11 +43,13 @@ import hashlib
 import os
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from urllib.parse import quote
 from datetime import datetime
 
 import feedparser
 import requests
+import yfinance as yf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -153,10 +155,33 @@ def fetch_fundamentals():
         return jsonify({"error": "symbol query parameter is required"}), 400
 
     yahoo_symbol = _to_yahoo_symbol(symbol)
-    try:
+
+    # yfinance's `.info` makes several sequential HTTP calls to Yahoo and
+    # can occasionally take much longer than the fast_info calls used
+    # elsewhere in this app — sometimes long enough to exceed gunicorn's
+    # own worker timeout (30s by default). When THAT happens, the worker
+    # gets killed mid-request and the client sees a raw, unhelpful 502
+    # Bad Gateway with no JSON body at all — confirmed as the actual
+    # symptom being fixed here, not a guess. Running the slow call in a
+    # background thread with our OWN shorter timeout means this endpoint
+    # controls its own failure and always returns a proper, readable JSON
+    # error instead of silently dying and letting the platform's generic
+    # 502 be the only thing the user ever sees.
+    def _blocking_fetch():
         stock = yf.Ticker(yahoo_symbol)
-        info = stock.info
+        return stock.info
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_blocking_fetch)
+            info = future.result(timeout=20)
+    except FuturesTimeoutError:
+        logger.warning(f"{yahoo_symbol} - fundamentals fetch timed out after 20s")
+        return jsonify({
+            "error": "Fundamentals lookup timed out — Yahoo Finance took too long to respond. Try again in a moment.",
+        }), 504
     except Exception as e:
+        logger.error(f"{yahoo_symbol} - fundamentals fetch failed: {e}")
         return jsonify({"error": f"Could not fetch fundamentals: {e}"}), 502
 
     if not info or info.get("trailingPE") is None and info.get("regularMarketPrice") is None:
