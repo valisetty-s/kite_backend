@@ -125,23 +125,32 @@ def fetch_fundamentals():
     """
     Query param: ?symbol=AARTIIND  (single stock only — see why below)
 
-    Returns PE (trailing + forward), P/B, PEG, ROE, and debt-to-equity.
+    Returns PE (trailing + forward), P/B, PEG, ROE, Debt/Equity, and now
+    also ROCE and Debt Ratio — both CALCULATED here, not provided
+    directly by Yahoo/yfinance as ready-made fields:
+      ROCE = EBIT / (Total Assets - Current Liabilities)
+      Debt Ratio = Total Debt / Total Assets
+    using `.income_stmt` (for EBIT) and `.balance_sheet` (for the rest),
+    the most recent reported period available.
 
     WHY THIS IS A SEPARATE, SINGLE-SYMBOL ENDPOINT rather than being
     bundled into /api/quotes for the whole portfolio at once: it uses
-    yfinance's `.info` (not `fast_info`), which fetches a much larger
-    payload per stock and is noticeably slower. Bundling this into the
-    ~96-stock bulk price fetch would meaningfully slow down every single
-    "Fetch latest prices" tap, for data that's only useful when you're
-    actually looking at one stock's fundamentals — so it's fetched on
-    demand instead, one stock at a time.
+    yfinance's `.info`/`.balance_sheet`/`.income_stmt` (not `fast_info`),
+    each fetching a much larger payload per stock and each noticeably
+    slower — and, confirmed directly from real use, prone to Yahoo's
+    rate limiting on this class of endpoint. Bundling this into the
+    ~96-stock bulk price fetch would make that rate limiting far worse,
+    not better — so it stays on-demand, one stock at a time, with the
+    frontend caching results for the rest of the day once fetched.
 
-    WHAT'S DELIBERATELY NOT HERE: ROCE (Return on Capital Employed) is
-    not returned because it isn't available from Yahoo Finance / yfinance
-    at all, for any stock — confirmed directly, not assumed. It's not a
-    standard field in Western financial data feeds; Indian sites like
-    Screener.in compute it themselves from raw financial statements. This
-    endpoint won't fabricate a number for it.
+    ON ROCE SPECIFICALLY: Yahoo/yfinance has never provided ROCE as a
+    ready field, confirmed directly — it's not a standard field in
+    Western financial data feeds. What changed here is that it can now
+    be CALCULATED from the same raw statement data yfinance does expose
+    (EBIT, Total Assets, Current Liabilities), rather than pulled as a
+    pre-computed number. If a stock's statement data doesn't include one
+    of those three figures under any of the field-name variants checked
+    below, ROCE for that stock is left as null rather than guessed at.
 
     A CAVEAT ON PEG SPECIFICALLY: there's a documented, known yfinance
     issue (GitHub #903) where pegRatio can return wildly incorrect values
@@ -156,25 +165,28 @@ def fetch_fundamentals():
 
     yahoo_symbol = _to_yahoo_symbol(symbol)
 
-    # yfinance's `.info` makes several sequential HTTP calls to Yahoo and
-    # can occasionally take much longer than the fast_info calls used
-    # elsewhere in this app — sometimes long enough to exceed gunicorn's
-    # own worker timeout (30s by default). When THAT happens, the worker
-    # gets killed mid-request and the client sees a raw, unhelpful 502
-    # Bad Gateway with no JSON body at all — confirmed as the actual
-    # symptom being fixed here, not a guess. Running the slow call in a
-    # background thread with our OWN shorter timeout means this endpoint
-    # controls its own failure and always returns a proper, readable JSON
-    # error instead of silently dying and letting the platform's generic
-    # 502 be the only thing the user ever sees.
+    # All three slow calls (.info, .balance_sheet, .income_stmt) run
+    # together in the SAME background thread, under the SAME 20s budget —
+    # deliberately not three separate timed calls, since that would only
+    # add more sequential exposure to gunicorn's own worker timeout and
+    # to Yahoo's rate limiting, for no benefit.
     def _blocking_fetch():
         stock = yf.Ticker(yahoo_symbol)
-        return stock.info
+        info = stock.info
+        try:
+            balance_sheet = stock.balance_sheet
+        except Exception:
+            balance_sheet = None
+        try:
+            income_stmt = stock.income_stmt
+        except Exception:
+            income_stmt = None
+        return info, balance_sheet, income_stmt
 
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_blocking_fetch)
-            info = future.result(timeout=20)
+            info, balance_sheet, income_stmt = future.result(timeout=20)
     except FuturesTimeoutError:
         logger.warning(f"{yahoo_symbol} - fundamentals fetch timed out after 20s")
         return jsonify({
@@ -190,6 +202,8 @@ def fetch_fundamentals():
         # explicitly rather than returning a payload of nulls silently.
         return jsonify({"error": f"No fundamentals data found for {yahoo_symbol} — check the symbol is correct"}), 404
 
+    roce, debt_ratio = _compute_roce_and_debt_ratio(balance_sheet, income_stmt)
+
     return jsonify({
         "status": "success",
         "symbol": symbol,
@@ -201,8 +215,58 @@ def fetch_fundamentals():
             "return_on_equity": info.get("returnOnEquity"),
             "debt_to_equity": info.get("debtToEquity"),
             "profit_margin": info.get("profitMargins"),
+            "roce": roce,
+            "debt_ratio": debt_ratio,
         },
     })
+
+
+def _first_matching_row(df, candidate_labels):
+    """
+    yfinance's balance_sheet/income_stmt DataFrames index rows by label
+    strings, and the exact label used can vary slightly by stock/data
+    source (e.g. "Total Debt" vs "TotalDebt", "EBIT" vs "Operating
+    Income" as a stand-in when EBIT itself isn't separately reported).
+    Tries each candidate in order and returns the most recent period's
+    value (first/leftmost column) from the first one that exists —
+    or None if the dataframe is missing or none of the candidates match.
+    """
+    if df is None or df.empty:
+        return None
+    for label in candidate_labels:
+        if label in df.index:
+            try:
+                val = df.loc[label].iloc[0]
+                return float(val) if val is not None else None
+            except (ValueError, TypeError, IndexError):
+                continue
+    return None
+
+
+def _compute_roce_and_debt_ratio(balance_sheet, income_stmt):
+    """
+    ROCE = EBIT / (Total Assets - Current Liabilities)
+    Debt Ratio = Total Debt / Total Assets
+    Returns (roce, debt_ratio) as floats (fractions, not %), or None for
+    either if the underlying data isn't available for this stock — never
+    a fabricated or guessed number.
+    """
+    total_assets = _first_matching_row(balance_sheet, ["Total Assets"])
+    current_liabilities = _first_matching_row(balance_sheet, ["Current Liabilities", "Total Current Liabilities"])
+    total_debt = _first_matching_row(balance_sheet, ["Total Debt"])
+    ebit = _first_matching_row(income_stmt, ["EBIT", "Operating Income"])
+
+    roce = None
+    if ebit is not None and total_assets is not None and current_liabilities is not None:
+        capital_employed = total_assets - current_liabilities
+        if capital_employed:
+            roce = round(ebit / capital_employed, 4)
+
+    debt_ratio = None
+    if total_debt is not None and total_assets:
+        debt_ratio = round(total_debt / total_assets, 4)
+
+    return roce, debt_ratio
 
 
 @app.route("/api/quotes", methods=["GET"])
