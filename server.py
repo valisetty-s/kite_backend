@@ -269,6 +269,54 @@ def _compute_roce_and_debt_ratio(balance_sheet, income_stmt):
     return roce, debt_ratio
 
 
+@app.route("/api/indices", methods=["GET"])
+def fetch_indices():
+    """
+    No query params — always returns the same four fixed indices:
+    Sensex, Nifty 50, Nifty Smallcap 100, Nifty Midcap 100.
+
+    Symbols confirmed directly against Yahoo Finance's own quote pages
+    (not assumed): ^BSESN (Sensex), ^NSEI (Nifty 50), ^CNXSC (Nifty
+    Smallcap 100), NIFTY_MIDCAP_100.NS (Nifty Midcap 100 — note this one
+    doesn't follow the ^-prefixed pattern the others do; that's simply
+    how Yahoo lists it).
+
+    Deliberately calls _fetch_one_quote() directly with these exact
+    symbols, bypassing _to_yahoo_symbol() — that helper appends ".NS" to
+    anything not already suffixed, which would incorrectly turn "^BSESN"
+    into "^BSESN.NS" and break the lookup. These four symbols are already
+    in their correct, final Yahoo form and need no transformation at all.
+
+    Uses the same proven chart-API fetch mechanism as /api/quotes, so it
+    carries the same reliability characteristics (and the same
+    "no auth needed" simplicity) already established there.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    INDEX_SYMBOLS = {
+        "SENSEX": "^BSESN",
+        "NIFTY50": "^NSEI",
+        "NIFTY_SMALLCAP_100": "^CNXSC",
+        "NIFTY_MIDCAP_100": "NIFTY_MIDCAP_100.NS",
+    }
+
+    def _do_fetch(label, yahoo_symbol):
+        try:
+            return label, _fetch_one_quote(yahoo_symbol)
+        except Exception as e:
+            logger.error(f"Failed to fetch index {label} ({yahoo_symbol}): {e}")
+            return label, {"error": str(e)}
+
+    indices = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_do_fetch, label, sym): label for label, sym in INDEX_SYMBOLS.items()}
+        for future in as_completed(futures):
+            label, res = future.result()
+            indices[label] = res
+
+    return jsonify({"status": "success", "indices": indices})
+
+
 @app.route("/api/quotes", methods=["GET"])
 def fetch_quotes():
     """
