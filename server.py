@@ -123,41 +123,12 @@ def get_logs():
 @app.route("/api/fundamentals", methods=["GET"])
 def fetch_fundamentals():
     """
-    Query param: ?symbol=AARTIIND  (single stock only — see why below)
+    Query param: ?symbol=AARTIIND
 
-    Returns PE (trailing + forward), P/B, PEG, ROE, Debt/Equity, and now
-    also ROCE and Debt Ratio — both CALCULATED here, not provided
-    directly by Yahoo/yfinance as ready-made fields:
-      ROCE = EBIT / (Total Assets - Current Liabilities)
-      Debt Ratio = Total Debt / Total Assets
-    using `.income_stmt` (for EBIT) and `.balance_sheet` (for the rest),
-    the most recent reported period available.
-
-    WHY THIS IS A SEPARATE, SINGLE-SYMBOL ENDPOINT rather than being
-    bundled into /api/quotes for the whole portfolio at once: it uses
-    yfinance's `.info`/`.balance_sheet`/`.income_stmt` (not `fast_info`),
-    each fetching a much larger payload per stock and each noticeably
-    slower — and, confirmed directly from real use, prone to Yahoo's
-    rate limiting on this class of endpoint. Bundling this into the
-    ~96-stock bulk price fetch would make that rate limiting far worse,
-    not better — so it stays on-demand, one stock at a time, with the
-    frontend caching results for the rest of the day once fetched.
-
-    ON ROCE SPECIFICALLY: Yahoo/yfinance has never provided ROCE as a
-    ready field, confirmed directly — it's not a standard field in
-    Western financial data feeds. What changed here is that it can now
-    be CALCULATED from the same raw statement data yfinance does expose
-    (EBIT, Total Assets, Current Liabilities), rather than pulled as a
-    pre-computed number. If a stock's statement data doesn't include one
-    of those three figures under any of the field-name variants checked
-    below, ROCE for that stock is left as null rather than guessed at.
-
-    A CAVEAT ON PEG SPECIFICALLY: there's a documented, known yfinance
-    issue (GitHub #903) where pegRatio can return wildly incorrect values
-    for some tickers, for reasons not fully understood even by yfinance's
-    own maintainers. It's still returned here since it's often correct,
-    but the frontend shows it with a visibly different treatment so it's
-    not mistaken for as-reliable as the others.
+    Returns PE (trailing + forward), P/B, PEG, ROE, Debt/Equity, and
+    profit margin — a single `.info` call. ROCE/Debt Ratio live in a
+    SEPARATE endpoint (/api/fundamentals/roce below) so a rate limit on
+    that heavier lookup never affects these core, reliable fields.
     """
     symbol = request.args.get("symbol", "").strip()
     if not symbol:
@@ -165,28 +136,14 @@ def fetch_fundamentals():
 
     yahoo_symbol = _to_yahoo_symbol(symbol)
 
-    # All three slow calls (.info, .balance_sheet, .income_stmt) run
-    # together in the SAME background thread, under the SAME 20s budget —
-    # deliberately not three separate timed calls, since that would only
-    # add more sequential exposure to gunicorn's own worker timeout and
-    # to Yahoo's rate limiting, for no benefit.
     def _blocking_fetch():
         stock = yf.Ticker(yahoo_symbol)
-        info = stock.info
-        try:
-            balance_sheet = stock.balance_sheet
-        except Exception:
-            balance_sheet = None
-        try:
-            income_stmt = stock.income_stmt
-        except Exception:
-            income_stmt = None
-        return info, balance_sheet, income_stmt
+        return stock.info
 
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_blocking_fetch)
-            info, balance_sheet, income_stmt = future.result(timeout=20)
+            info = future.result(timeout=20)
     except FuturesTimeoutError:
         logger.warning(f"{yahoo_symbol} - fundamentals fetch timed out after 20s")
         return jsonify({
@@ -197,12 +154,7 @@ def fetch_fundamentals():
         return jsonify({"error": f"Could not fetch fundamentals: {e}"}), 502
 
     if not info or info.get("trailingPE") is None and info.get("regularMarketPrice") is None:
-        # yfinance sometimes returns a near-empty dict for an unrecognized
-        # or delisted symbol rather than raising — treat that as "no data"
-        # explicitly rather than returning a payload of nulls silently.
         return jsonify({"error": f"No fundamentals data found for {yahoo_symbol} — check the symbol is correct"}), 404
-
-    roce, debt_ratio = _compute_roce_and_debt_ratio(balance_sheet, income_stmt)
 
     return jsonify({
         "status": "success",
@@ -215,10 +167,56 @@ def fetch_fundamentals():
             "return_on_equity": info.get("returnOnEquity"),
             "debt_to_equity": info.get("debtToEquity"),
             "profit_margin": info.get("profitMargins"),
-            "roce": roce,
-            "debt_ratio": debt_ratio,
         },
     })
+
+
+@app.route("/api/fundamentals/roce", methods=["GET"])
+def fetch_roce():
+    """
+    Query param: ?symbol=AARTIIND
+    Separate, optional endpoint for ROCE/Debt Ratio, isolated from
+    /api/fundamentals so a rate limit here never blocks core fields.
+    ROCE = EBIT / (Total Assets - Current Liabilities)
+    Debt Ratio = Total Debt / Total Assets
+    """
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"error": "symbol query parameter is required"}), 400
+
+    yahoo_symbol = _to_yahoo_symbol(symbol)
+
+    def _blocking_fetch():
+        stock = yf.Ticker(yahoo_symbol)
+        try:
+            balance_sheet = stock.balance_sheet
+        except Exception:
+            balance_sheet = None
+        try:
+            income_stmt = stock.income_stmt
+        except Exception:
+            income_stmt = None
+        return balance_sheet, income_stmt
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_blocking_fetch)
+            balance_sheet, income_stmt = future.result(timeout=20)
+    except FuturesTimeoutError:
+        return jsonify({"error": "ROCE lookup timed out — Yahoo Finance took too long to respond."}), 504
+    except Exception as e:
+        logger.error(f"{yahoo_symbol} - ROCE fetch failed: {e}")
+        return jsonify({"error": f"Could not fetch ROCE/Debt Ratio: {e}"}), 502
+
+    roce, debt_ratio = _compute_roce_and_debt_ratio(balance_sheet, income_stmt)
+
+    if roce is None and debt_ratio is None:
+        return jsonify({
+            "error": f"Balance sheet / income statement data not available for {yahoo_symbol}",
+        }), 404
+
+    return jsonify({"status": "success", "symbol": symbol, "roce": roce, "debt_ratio": debt_ratio})
+
 
 
 def _first_matching_row(df, candidate_labels):
