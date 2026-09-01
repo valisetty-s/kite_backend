@@ -493,29 +493,33 @@ def _fetch_one_quote(yahoo_symbol):
         # change% that looked like a multi-month/yearly move instead of a
         # single day's move. Fixed by scanning from the END of the array
         # backward instead.
+        # FIX: use IST-aware date comparison against bar timestamps.
+        # Old code: "2nd non-null from end" — when market is open, today's
+        # bar has null close, so 1st non-null = yesterday, 2nd = 2 days ago.
+        # Result: change% was computed over 2 days, not 1 (user's exact symptom).
+        # Fix: find the most recent bar whose IST date is < today's IST date.
+        # That is always yesterday's official close, regardless of market status.
+        from datetime import datetime, timedelta, timezone
+        IST = timezone(timedelta(hours=5, minutes=30))
+        today_ist = datetime.now(IST).date()
+
         raw_closes = q.get("close") or []
         prev_close = None
-        prev_close_index_from_end = None
 
         logger.debug(f"{yahoo_symbol} - Last 5 closes: {raw_closes[-5:]}, Last 5 timestamps: {timestamps[-5:]}")
 
-        valid_closes_found = 0
-        for i in range(len(raw_closes) - 1, -1, -1):
-            if raw_closes[i] is not None and raw_closes[i] != 0:
-                valid_closes_found += 1
-                # The FIRST valid close found scanning backward is today's
-                # (or the most recent trading day's) close. The SECOND
-                # valid close found is the previous trading day — the one
-                # we actually want for a 1-day change.
-                if valid_closes_found == 2:
-                    prev_close = raw_closes[i]
-                    prev_close_index_from_end = len(raw_closes) - 1 - i
-                    break
+        for i in range(len(timestamps) - 1, -1, -1):
+            if i >= len(raw_closes): continue
+            c = raw_closes[i]
+            if c is None or c == 0: continue
+            bar_date = datetime.fromtimestamp(timestamps[i], tz=IST).date()
+            if bar_date < today_ist:
+                prev_close = c
+                logger.debug(f"{yahoo_symbol} - prev_close={c} bar_date={bar_date} today_ist={today_ist}")
+                break
 
         if prev_close is None:
-            logger.warning(f"{yahoo_symbol} - Could not find valid previous close")
-        else:
-            logger.debug(f"{yahoo_symbol} - Using previous close: {prev_close} ({prev_close_index_from_end} trading days back)")
+            logger.warning(f"{yahoo_symbol} - Could not find prev close before today ({today_ist})")
         
         change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
         logger.info(f"{yahoo_symbol} - Change %: {change_pct} (current: {last_price}, prev: {prev_close})")
