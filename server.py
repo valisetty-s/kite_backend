@@ -504,22 +504,34 @@ def _fetch_one_quote(yahoo_symbol):
         today_ist = datetime.now(IST).date()
 
         raw_closes = q.get("close") or []
-        prev_close = None
 
-        logger.debug(f"{yahoo_symbol} - Last 5 closes: {raw_closes[-5:]}, Last 5 timestamps: {timestamps[-5:]}")
+        # PRIMARY: meta.previousClose is Yahoo's own "yesterday's official
+        # close", computed on the SAME unadjusted basis as regularMarketPrice.
+        # Using these two together is the only way to guarantee consistent
+        # pricing — the close[] series in indicators may be split/dividend-
+        # adjusted while regularMarketPrice is NOT, which silently produced
+        # wrong change% whenever a stock had a corporate action in the window
+        # (e.g. IZMO showing +7% when actually -2%).
+        prev_close = meta.get("previousClose")
 
-        for i in range(len(timestamps) - 1, -1, -1):
-            if i >= len(raw_closes): continue
-            c = raw_closes[i]
-            if c is None or c == 0: continue
-            bar_date = datetime.fromtimestamp(timestamps[i], tz=IST).date()
-            if bar_date < today_ist:
-                prev_close = c
-                logger.debug(f"{yahoo_symbol} - prev_close={c} bar_date={bar_date} today_ist={today_ist}")
-                break
+        if prev_close:
+            logger.debug(f"{yahoo_symbol} - prev_close={prev_close} (from meta.previousClose)")
+        else:
+            # Fallback: scan close series backward for the last bar strictly
+            # before today in IST. Only used when meta.previousClose is null
+            # (rare for NSE but possible for very thinly traded stocks).
+            for i in range(len(timestamps) - 1, -1, -1):
+                if i >= len(raw_closes): continue
+                c = raw_closes[i]
+                if c is None or c == 0: continue
+                bar_date = datetime.fromtimestamp(timestamps[i], tz=IST).date()
+                if bar_date < today_ist:
+                    prev_close = c
+                    logger.debug(f"{yahoo_symbol} - prev_close={c} from bar {bar_date} (fallback, meta.previousClose was null)")
+                    break
 
         if prev_close is None:
-            logger.warning(f"{yahoo_symbol} - Could not find prev close before today ({today_ist})")
+            logger.warning(f"{yahoo_symbol} - Could not determine prev_close")
         
         change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
         logger.info(f"{yahoo_symbol} - Change %: {change_pct} (current: {last_price}, prev: {prev_close})")
