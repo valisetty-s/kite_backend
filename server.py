@@ -55,15 +55,15 @@ NEWS_FETCH_HEADERS = {
 global_cues_cache = {"timestamp": 0, "data": None}
 
 
-def call_gemini(prompt, max_retries=3):
+def call_gemini(prompt):
     """
-    Calls Gemini API with automatic exponential backoff to handle temporary
-    503 (high demand) and timeout spikes.
+    Calls Gemini API with automatic model routing. 
+    Attempts the primary model first, and falls back to a lighter, 
+    high-availability model if the primary is experiencing 503 spikes.
     """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is missing on backend")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -72,34 +72,39 @@ def call_gemini(prompt, max_retries=3):
         }
     }
 
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Calling Gemini API (attempt {attempt}/{max_retries})...")
-            resp = requests.post(url, json=payload, timeout=40)
+    # Primary and fallback model endpoints
+    endpoints = [
+        ("gemini-3.8-flash", f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}", 40),
+        ("gemini-3.5-flash-lite", f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_API_KEY}", 25)
+    ]
 
+    last_error = None
+    for model_name, url, timeout_secs in endpoints:
+        logger.info(f"Attempting Gemini API using {model_name}...")
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout_secs)
+            
             if resp.status_code in (503, 429):
-                wait_time = attempt * 2
-                logger.warning(f"Gemini {resp.status_code} spike on attempt {attempt}. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
+                logger.warning(f"{model_name} returned {resp.status_code}. Routing to fallback...")
+                last_error = f"HTTP {resp.status_code}"
                 continue
 
             data = resp.json()
             if resp.status_code != 200:
-                raise Exception(f"Gemini API error: {data}")
+                logger.error(f"{model_name} error: {data}")
+                last_error = str(data)
+                continue
 
             return data["candidates"][0]["content"]["parts"][0]["text"]
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            last_error = e
-            wait_time = attempt * 2
-            logger.warning(f"Gemini connection issue on attempt {attempt}: {e}. Retrying in {wait_time}s...")
-            time.sleep(wait_time)
+            logger.warning(f"Connection/Timeout on {model_name}: {e}. Routing to fallback...")
+            last_error = str(e)
+            continue
         except Exception as e:
             raise e
 
-    raise Exception(f"Gemini service unavailable after {max_retries} attempts: {last_error or '503 Unavailable'}")
-
+    raise Exception(f"All Gemini models unavailable. Last error: {last_error}")
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
