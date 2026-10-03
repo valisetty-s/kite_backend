@@ -5,7 +5,7 @@ Endpoints:
   1. POST /api/kite/exchange — Completes Kite Connect OAuth.
   2. GET /api/news — Fetches Google News RSS for one company.
   3. GET /api/quotes — Returns live price and % change from Yahoo Finance.
-  4. GET /api/fundamentals — Returns trailing PE, P/B, etc.
+  4. GET /api/fundamentals — Returns trailing PE, P/B, Debt, etc.
   5. GET /api/fundamentals/roce — Returns ROCE & Debt Ratio calculated from balance sheets.
   6. GET /api/market/global-cues — Overnight macro cues synthesized by Gemini.
   7. POST /api/ai/briefing — Single-stock 1-minute AI briefing using Gemini.
@@ -57,9 +57,8 @@ global_cues_cache = {"timestamp": 0, "data": None}
 
 def call_gemini(prompt):
     """
-    Calls Gemini API with automatic model routing. 
-    Attempts the primary model first, and falls back to a lighter, 
-    high-availability model if the primary is experiencing 503 spikes.
+    Calls Gemini API with automatic model routing:
+    Attempts primary gemini-3.8-flash, falls back to gemini-3.5-flash-lite on 503/timeout.
     """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is missing on backend")
@@ -72,9 +71,8 @@ def call_gemini(prompt):
         }
     }
 
-    # Primary and fallback model endpoints
     endpoints = [
-        ("gemini-3.8-flash", f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}", 40),
+        ("gemini-3.8-flash", f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}", 35),
         ("gemini-3.5-flash-lite", f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_API_KEY}", 25)
     ]
 
@@ -83,7 +81,7 @@ def call_gemini(prompt):
         logger.info(f"Attempting Gemini API using {model_name}...")
         try:
             resp = requests.post(url, json=payload, timeout=timeout_secs)
-            
+
             if resp.status_code in (503, 429):
                 logger.warning(f"{model_name} returned {resp.status_code}. Routing to fallback...")
                 last_error = f"HTTP {resp.status_code}"
@@ -105,6 +103,7 @@ def call_gemini(prompt):
             raise e
 
     raise Exception(f"All Gemini models unavailable. Last error: {last_error}")
+
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
@@ -206,13 +205,11 @@ def ai_briefing():
     if not GEMINI_API_KEY:
         return jsonify({"error": "GEMINI_API_KEY is not configured on the backend"}), 500
 
-    # FIX: Properly distinguish between an API failure (empty dict) and actual bad metrics.
-    is_missing_data = not fundamentals or len(fundamentals) == 0
-    fund_str = "Data temporarily unavailable (API timeout)" if is_missing_data else json.dumps(fundamentals)
+    fund_str = json.dumps(fundamentals) if fundamentals else "Live metrics unavailable"
 
-    prompt = f"Analyze Indian stock {company} ({symbol}) for an investor based on the following verified data:\n"
+    prompt = f"Analyze Indian stock {company} ({symbol}) for an equity investor based on the data below:\n"
     prompt += f"Portfolio Classification Tier: {tier} (Context: Top30=Accumulate, Top31-50=Hold, Top51-75=Trim, Watch=High Risk / Speculative / Exit)\n"
-    prompt += f"Fundamentals (Trailing P/E, P/B, Debt, ROE, etc.): {fund_str}\n"
+    prompt += f"Reported Fundamentals: {fund_str}\n"
     prompt += "Recent News Headlines:\n"
     for n in news[:5]:
         prompt += f"- {n.get('title')}\n"
@@ -221,16 +218,17 @@ def ai_briefing():
 Provide a structured JSON response EXACTLY matching this schema:
 {
   "business_summary": "1 concise sentence explaining what the company produces or does.",
-  "financial_health": "1 concise sentence evaluating financial health based on PE, debt, profitability, and capital structure. State clearly if the company is loss-making, over-leveraged, or if metrics are missing.",
+  "financial_health": "1 concise sentence evaluating solvency, valuation, debt, and profitability.",
   "sentiment": "BULLISH, BEARISH, or NOISE",
-  "key_catalyst": "1 concise sentence on the most impactful recent development or headline.",
-  "key_risk": "1 concise sentence on potential solvency, regulatory, margin, or operational risks."
+  "key_catalyst": "1 concise sentence on the most impactful recent catalyst or development.",
+  "key_risk": "1 concise sentence on primary solvency, debt, margin, or operational risks."
 }
 
 CRITICAL RULES FOR SENTIMENT CLASSIFICATION:
-1. Base sentiment on solvency, valuation, business health, and financial viability FIRST, not short-term corporate PR announcements or isolated operational wins.
-2. If fundamentals clearly indicate severe distress (e.g. persistent net losses, negative P/E, heavy debt), DO NOT mark sentiment as BULLISH based purely on positive headlines. Mark it BEARISH.
-3. If Fundamentals are 'Data temporarily unavailable (API timeout)', base your sentiment primarily on the recent news headlines and the Portfolio Tier. Do not invent or assume the company is loss-making or distressed just because data is missing.
+1. Synthesize verified fundamentals, recent headlines, and established company knowledge.
+2. For stocks in the 'Watch' tier, or companies with known heavy debt, ongoing insolvency disputes, or negative net worth, DO NOT mark sentiment as BULLISH based on short-term capacity gains or promotional headlines. Classify them as BEARISH or NOISE.
+3. For sound, growing, profitable companies (especially in Top30 or Top31-50 tiers) with positive momentum or contract wins, classify as BULLISH.
+4. If news is minor, promotional, or inconclusive, classify as NOISE.
 """
     try:
         response_text = call_gemini(prompt)
@@ -262,8 +260,10 @@ def fetch_fundamentals():
     except Exception as e:
         return jsonify({"error": f"Could not fetch fundamentals: {e}"}), 502
 
-    if not info or (info.get("trailingPE") is None and info.get("regularMarketPrice") is None):
-        return jsonify({"error": f"No fundamentals data found for {yahoo_symbol}"}), 404
+    # Check multiple price keys so loss-making stocks don't trigger a 404
+    has_price = any(info.get(k) is not None for k in ["currentPrice", "regularMarketPrice", "previousClose", "open"])
+    if not info or not has_price:
+        return jsonify({"error": f"No data found for {yahoo_symbol}"}), 404
 
     return jsonify({
         "status": "success",
@@ -276,6 +276,8 @@ def fetch_fundamentals():
             "return_on_equity": info.get("returnOnEquity"),
             "debt_to_equity": info.get("debtToEquity"),
             "profit_margin": info.get("profitMargins"),
+            "total_debt": info.get("totalDebt"),
+            "market_cap": info.get("marketCap")
         },
     })
 
