@@ -25,6 +25,7 @@ import requests
 import yfinance as yf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+import requests
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -53,8 +54,8 @@ NEWS_FETCH_HEADERS = {
 
 global_cues_cache = {"timestamp": 0, "data": None}
 
-def call_gemini(prompt):
-    # Updated to gemini-3.8-flash
+
+def call_gemini(prompt, max_retries=3):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -63,12 +64,37 @@ def call_gemini(prompt):
             "responseMimeType": "application/json"
         }
     }
-    resp = requests.post(url, json=payload, timeout=25)
-    data = resp.json()
-    if resp.status_code != 200:
-        raise Exception(f"Gemini API error: {data}")
-    return data["candidates"][0]["content"]["parts"][0]["text"]
 
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Calling Gemini API (attempt {attempt}/{max_retries})...")
+            # Increased timeout from 25s to 40s to allow Gemini buffer room during traffic surges
+            resp = requests.post(url, json=payload, timeout=40)
+            
+            # Handle temporary Google-side capacity issues
+            if resp.status_code == 503 or resp.status_code == 429:
+                wait_time = attempt * 2  # wait 2s, then 4s, etc.
+                logger.warning(f"Gemini {resp.status_code} spike on attempt {attempt}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+
+            data = resp.json()
+            if resp.status_code != 200:
+                raise Exception(f"Gemini API error: {data}")
+
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            wait_time = attempt * 2
+            logger.warning(f"Gemini connection/timeout issue on attempt {attempt}: {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+        except Exception as e:
+            # Fatal error (e.g. invalid API key or malformed request), don't retry
+            raise e
+
+    raise Exception(f"Gemini service busy after {max_retries} attempts: {last_error or '503 Unavailable'}")
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
