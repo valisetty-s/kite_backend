@@ -195,13 +195,15 @@ def ai_briefing():
     symbol = body.get("symbol", "").strip()
     company = body.get("company", "").strip()
     tier = body.get("tier", "Watch").strip()
-    fundamentals = body.get("fundamentals")
+    fundamentals = body.get("fundamentals", {})
     news = body.get("news", [])
 
     if not GEMINI_API_KEY:
         return jsonify({"error": "GEMINI_API_KEY is not configured on the backend"}), 500
 
-    fund_str = json.dumps(fundamentals) if fundamentals else "Unavailable or Loss-making"
+    # FIX: Properly distinguish between an API failure (empty dict) and actual bad metrics.
+    is_missing_data = not fundamentals or len(fundamentals) == 0
+    fund_str = "Data temporarily unavailable (API timeout)" if is_missing_data else json.dumps(fundamentals)
 
     prompt = f"Analyze Indian stock {company} ({symbol}) for an investor based on the following verified data:\n"
     prompt += f"Portfolio Classification Tier: {tier} (Context: Top30=Accumulate, Top31-50=Hold, Top51-75=Trim, Watch=High Risk / Speculative / Exit)\n"
@@ -222,7 +224,8 @@ Provide a structured JSON response EXACTLY matching this schema:
 
 CRITICAL RULES FOR SENTIMENT CLASSIFICATION:
 1. Base sentiment on solvency, valuation, business health, and financial viability FIRST, not short-term corporate PR announcements or isolated operational wins.
-2. If fundamentals indicate severe distress (e.g. persistent net losses, negative net worth, heavy debt), or if fundamentals are missing/loss-making for a stock assigned to the 'Watch' tier, DO NOT mark sentiment as BULLISH based purely on positive headlines. Mark it BEARISH or NOISE.
+2. If fundamentals clearly indicate severe distress (e.g. persistent net losses, negative P/E, heavy debt), DO NOT mark sentiment as BULLISH based purely on positive headlines. Mark it BEARISH.
+3. If Fundamentals are 'Data temporarily unavailable (API timeout)', base your sentiment primarily on the recent news headlines and the Portfolio Tier. Do not invent or assume the company is loss-making or distressed just because data is missing.
 """
     try:
         response_text = call_gemini(prompt)
