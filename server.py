@@ -60,9 +60,11 @@ NEWS_FETCH_HEADERS = {
 }
 
 # Known aggregators/bots that frequently recycle old news with today's date
+# Expanded list of known aggregators/bots that frequently recycle old news
 JUNK_SOURCES = [
     "simply wall st", "zacks", "investorplace", "tipranks", 
-    "motley fool", "dsij", "dalal street investment journal", "tradingview"
+    "motley fool", "dsij", "dalal street investment journal", 
+    "tradingview", "goodreturns", "good returns"
 ]
 
 global_cues_cache = {"timestamp": 0, "data": None}
@@ -507,9 +509,8 @@ def fetch_news_for_company():
         return jsonify({"error": f"Could not parse RSS response: {e}"}), 502
 
     articles = []
-    now = datetime.now()
+    now_utc = datetime.utcnow()
 
-    # Iterate through all entries, but stop once we collect 5 valid, fresh articles
     for entry in parsed.entries:
         if len(articles) >= 5:
             break
@@ -525,16 +526,23 @@ def fetch_news_for_company():
         if any(junk in source.lower() for junk in JUNK_SOURCES):
             continue
 
-        # 2. Strict Date Filter: Enforce 7-day cutoff in Python
+        # 2. Strict Date Filter: Enforce exact 7-day cutoff using UTC
         published_parsed = entry.get("published_parsed")
-        if published_parsed:
-            try:
-                dt = datetime.fromtimestamp(mktime(published_parsed))
-                # If Google ignored the when:7d flag and sent old news, drop it
-                if now - dt > timedelta(days=7):
-                    continue
-            except Exception:
-                pass  # If date parsing fails, fall back to keeping the article
+        
+        # STRICT MODE: If there is no parseable date at all, drop the article immediately
+        if not published_parsed:
+            continue
+            
+        try:
+            # feedparser returns a UTC struct_time. Convert exactly to naive UTC datetime.
+            article_dt = datetime(*published_parsed[:6])
+            
+            # If the article is older than 7 days, drop it
+            if now_utc - article_dt > timedelta(days=7):
+                continue
+        except Exception:
+            # STRICT MODE: If the date parsing fails for any reason, drop the article
+            continue
 
         articles.append({
             "title": title,
