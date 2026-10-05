@@ -486,6 +486,20 @@ def _fetch_one_quote(yahoo_symbol):
 
 @app.route("/api/news", methods=["GET"])
 def fetch_news_for_company():
+    # 1. Self-contained imports to prevent server crashes
+    import datetime
+    from urllib.parse import quote
+    import feedparser
+    import requests
+
+    # 2. Aggressive spam filter for metadata-bumpers
+    JUNK_SOURCES = [
+        "simply wall st", "zacks", "investorplace", "tipranks", 
+        "motley fool", "dsij", "dalal street investment journal", 
+        "tradingview", "goodreturns", "good returns", "scanx", 
+        "scanx.trade", "equitybulls", "capital market"
+    ]
+
     company = request.args.get("company", "").strip().removesuffix("-BE")
     if not company:
         return jsonify({"error": "company query parameter is required"}), 400
@@ -494,6 +508,7 @@ def fetch_news_for_company():
     rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
 
     try:
+        # Uses your existing globally defined NEWS_FETCH_HEADERS
         resp = requests.get(rss_url, headers=NEWS_FETCH_HEADERS, timeout=12)
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Could not reach Google News: {e}"}), 502
@@ -510,7 +525,7 @@ def fetch_news_for_company():
         return jsonify({"error": f"Could not parse RSS response: {e}"}), 502
 
     articles = []
-    now_utc = datetime.utcnow()
+    now_utc = datetime.datetime.utcnow()
 
     for entry in parsed.entries:
         if len(articles) >= 5:
@@ -523,22 +538,19 @@ def fetch_news_for_company():
             title = raw_title[:sep_idx].strip()
             source = raw_title[sep_idx + 3:].strip()
 
-        # 1. Spam Filter: Skip known automated aggregator bots
+        # Spam Filter: Skip known automated aggregator bots
         if any(junk in source.lower() for junk in JUNK_SOURCES):
             continue
 
-        # 2. Strict Date Filter: Enforce exact 7-day cutoff using UTC
+        # Safe Date Filter: Only drop if we can mathematically prove it's > 14 days old
         published_parsed = entry.get("published_parsed")
-        
-        if not published_parsed:
-            continue
-            
-        try:
-            article_dt = datetime(*published_parsed[:6])
-            if now_utc - article_dt > timedelta(days=7):
-                continue
-        except Exception:
-            continue
+        if published_parsed:
+            try:
+                article_dt = datetime.datetime(*published_parsed[:6])
+                if now_utc - article_dt > datetime.timedelta(days=14):
+                    continue
+            except Exception:
+                pass  # Fallback: keep article if date parsing behaves weirdly
 
         articles.append({
             "title": title,
