@@ -530,19 +530,14 @@ def fetch_news_for_company():
         # 2. Strict Date Filter: Enforce exact 7-day cutoff using UTC
         published_parsed = entry.get("published_parsed")
         
-        # STRICT MODE: If there is no parseable date at all, drop the article immediately
         if not published_parsed:
             continue
             
         try:
-            # feedparser returns a UTC struct_time. Convert exactly to naive UTC datetime.
             article_dt = datetime(*published_parsed[:6])
-            
-            # If the article is older than 7 days, drop it
             if now_utc - article_dt > timedelta(days=7):
                 continue
         except Exception:
-            # STRICT MODE: If the date parsing fails for any reason, drop the article
             continue
 
         articles.append({
