@@ -27,6 +27,13 @@ import yfinance as yf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+import feedparser
+import requests
+from urllib.parse import quote
+from time import mktime
+from datetime import datetime, timedelta
+from flask import request, jsonify
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -51,6 +58,12 @@ NEWS_FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
+
+# Known aggregators/bots that frequently recycle old news with today's date
+JUNK_SOURCES = [
+    "simply wall st", "zacks", "investorplace", "tipranks", 
+    "motley fool", "dsij", "dalal street investment journal", "tradingview"
+]
 
 global_cues_cache = {"timestamp": 0, "data": None}
 
@@ -468,7 +481,6 @@ def _fetch_one_quote(yahoo_symbol):
         "near_52wk_flag": near_52wk_flag,
     }
 
-
 @app.route("/api/news", methods=["GET"])
 def fetch_news_for_company():
     company = request.args.get("company", "").strip().removesuffix("-BE")
@@ -495,13 +507,34 @@ def fetch_news_for_company():
         return jsonify({"error": f"Could not parse RSS response: {e}"}), 502
 
     articles = []
-    for entry in parsed.entries[:5]:
+    now = datetime.now()
+
+    # Iterate through all entries, but stop once we collect 5 valid, fresh articles
+    for entry in parsed.entries:
+        if len(articles) >= 5:
+            break
+
         raw_title = (entry.get("title") or "").strip()
         title, source = raw_title, "Google News"
         sep_idx = raw_title.rfind(" - ")
         if sep_idx > 0:
             title = raw_title[:sep_idx].strip()
             source = raw_title[sep_idx + 3:].strip()
+
+        # 1. Spam Filter: Skip known automated aggregator bots
+        if any(junk in source.lower() for junk in JUNK_SOURCES):
+            continue
+
+        # 2. Strict Date Filter: Enforce 7-day cutoff in Python
+        published_parsed = entry.get("published_parsed")
+        if published_parsed:
+            try:
+                dt = datetime.fromtimestamp(mktime(published_parsed))
+                # If Google ignored the when:7d flag and sent old news, drop it
+                if now - dt > timedelta(days=7):
+                    continue
+            except Exception:
+                pass  # If date parsing fails, fall back to keeping the article
 
         articles.append({
             "title": title,
