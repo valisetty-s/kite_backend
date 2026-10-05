@@ -61,10 +61,11 @@ NEWS_FETCH_HEADERS = {
 
 # Known aggregators/bots that frequently recycle old news with today's date
 # Expanded list of known aggregators/bots that frequently recycle old news
-JUNK_SOURCES = [
+UNK_SOURCES = [
     "simply wall st", "zacks", "investorplace", "tipranks", 
     "motley fool", "dsij", "dalal street investment journal", 
-    "tradingview", "goodreturns", "good returns"
+    "tradingview", "goodreturns", "good returns", "scanx", 
+    "scanx.trade", "equitybulls", "capital market"
 ]
 
 global_cues_cache = {"timestamp": 0, "data": None}
