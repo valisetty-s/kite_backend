@@ -293,10 +293,12 @@ def fetch_fundamentals():
             "debt_to_equity": info.get("debtToEquity"),
             "profit_margin": info.get("profitMargins"),
             "total_debt": info.get("totalDebt"),
-            "market_cap": info.get("marketCap")
+            "market_cap": info.get("marketCap"),
+            "industry_pe": info.get("industryTrailingPE") or info.get("sectorTrailingPE"),
+            "revenue_growth": info.get("revenueGrowth"),
+            "earnings_growth": info.get("earningsGrowth")
         },
     })
-
 
 @app.route("/api/fundamentals/roce", methods=["GET"])
 def fetch_roce():
