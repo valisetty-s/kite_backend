@@ -281,22 +281,33 @@ def fetch_fundamentals():
     if not info or not has_price:
         return jsonify({"error": f"No data found for {yahoo_symbol}"}), 404
 
+trailing_pe = info.get("trailingPE")
+    rev_growth = info.get("revenueGrowth")
+    earn_growth = info.get("earningsGrowth")
+
+    # Use Yahoo's PEG if available; otherwise calculate it from Trailing P/E and Growth
+    peg_ratio = info.get("trailingPegRatio") or info.get("pegRatio")
+    if peg_ratio is None and trailing_pe and trailing_pe > 0:
+        growth_for_peg = earn_growth if (earn_growth and earn_growth > 0) else rev_growth
+        if growth_for_peg and growth_for_peg > 0:
+            peg_ratio = round(trailing_pe / (growth_for_peg * 100), 2)
+
     return jsonify({
         "status": "success",
         "symbol": symbol,
         "fundamentals": {
-            "trailing_pe": info.get("trailingPE"),
+            "trailing_pe": trailing_pe,
             "forward_pe": info.get("forwardPE"),
             "price_to_book": info.get("priceToBook"),
-            "peg_ratio": info.get("trailingPegRatio") or info.get("pegRatio"),
+            "peg_ratio": peg_ratio,
             "return_on_equity": info.get("returnOnEquity"),
             "debt_to_equity": info.get("debtToEquity"),
             "profit_margin": info.get("profitMargins"),
             "total_debt": info.get("totalDebt"),
             "market_cap": info.get("marketCap"),
             "industry_pe": info.get("industryTrailingPE") or info.get("sectorTrailingPE"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "earnings_growth": info.get("earningsGrowth")
+            "revenue_growth": rev_growth,
+            "earnings_growth": earn_growth
         },
     })
 
@@ -451,8 +462,9 @@ def _fetch_one_quote(yahoo_symbol):
     IST = timezone(timedelta(hours=5, minutes=30))
     today_ist = datetime.now(IST).date()
     raw_closes = q.get("close") or []
-    prev_close = meta.get("previousClose")
+    prev_close = meta.get("regularMarketPreviousClose") or meta.get("previousClose")
 
+    # If Yahoo's meta previousClose is missing, grab the last completed trading day before today
     if not prev_close:
         for i in range(len(timestamps) - 1, -1, -1):
             if i >= len(raw_closes): continue
@@ -462,6 +474,7 @@ def _fetch_one_quote(yahoo_symbol):
             if bar_date < today_ist:
                 prev_close = c
                 break
+   
 
     change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
     vol_series = [v for v in (q.get("volume") or []) if v is not None]
