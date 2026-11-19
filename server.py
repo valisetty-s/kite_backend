@@ -281,7 +281,7 @@ def fetch_fundamentals():
     if not info or not has_price:
         return jsonify({"error": f"No data found for {yahoo_symbol}"}), 404
 
-trailing_pe = info.get("trailingPE")
+    trailing_pe = info.get("trailingPE")
     rev_growth = info.get("revenueGrowth")
     earn_growth = info.get("earningsGrowth")
 
