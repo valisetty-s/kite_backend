@@ -319,8 +319,7 @@ def fetch_fundamentals():
 
     fundamentals_cache[symbol] = {"timestamp": time.time(), "data": payload}
     return jsonify(payload)
-        },
-    })
+
 
 @app.route("/api/fundamentals/roce", methods=["GET"])
 def fetch_roce():
