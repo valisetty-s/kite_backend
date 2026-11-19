@@ -319,7 +319,7 @@ def _fetch_screener_fundamentals(symbol):
             tds = tr.select("td")
             if len(tds) == 2:
                 rows[tds[0].get_text(strip=True).rstrip(":")] = _parse_screener_num(tds[1].get_text(strip=True))
-        val = rows.get("TTM") if rows.get("TTM") is not None else rows.get("3 Years")
+        val = rows.get("3 Years") if rows.get("3 Years") is not None else rows.get("TTM")
         if "Sales Growth" in title and val is not None:
             rev_growth = val / 100.0
         elif "Profit Growth" in title and val is not None:
