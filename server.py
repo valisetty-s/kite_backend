@@ -303,6 +303,7 @@ def fetch_fundamentals():
             "return_on_equity": info.get("returnOnEquity"),
             "debt_to_equity": info.get("debtToEquity"),
             "profit_margin": info.get("profitMargins"),
+            "operating_margin": info.get("operatingMargins"), # <-- ADD THIS
             "total_debt": info.get("totalDebt"),
             "market_cap": info.get("marketCap"),
             "industry_pe": info.get("industryTrailingPE") or info.get("sectorTrailingPE"),
