@@ -69,7 +69,7 @@ UNK_SOURCES = [
 ]
 
 global_cues_cache = {"timestamp": 0, "data": None}
-
+fundamentals_cache = {}  # { symbol: {"timestamp": float, "data": dict} }
 
 def call_gemini(prompt):
     """
@@ -257,9 +257,14 @@ CRITICAL RULES FOR SENTIMENT CLASSIFICATION:
 
 @app.route("/api/fundamentals", methods=["GET"])
 def fetch_fundamentals():
-    symbol = request.args.get("symbol", "").strip()
+    symbol = request.args.get("symbol", "").strip().upper()
     if not symbol:
         return jsonify({"error": "symbol query parameter is required"}), 400
+
+    # Return cached fundamentals if less than 12 hours old
+    cached = fundamentals_cache.get(symbol)
+    if cached and (time.time() - cached["timestamp"] < 43200):
+        return jsonify(cached["data"])
 
     yahoo_symbol = _to_yahoo_symbol(symbol)
 
@@ -292,7 +297,7 @@ def fetch_fundamentals():
         if growth_for_peg and growth_for_peg > 0:
             peg_ratio = round(trailing_pe / (growth_for_peg * 100), 2)
 
-    return jsonify({
+    payload = {
         "status": "success",
         "symbol": symbol,
         "fundamentals": {
@@ -303,12 +308,17 @@ def fetch_fundamentals():
             "return_on_equity": info.get("returnOnEquity"),
             "debt_to_equity": info.get("debtToEquity"),
             "profit_margin": info.get("profitMargins"),
-            "operating_margin": info.get("operatingMargins"), # <-- ADD THIS
+            "operating_margin": info.get("operatingMargins"),
             "total_debt": info.get("totalDebt"),
             "market_cap": info.get("marketCap"),
             "industry_pe": info.get("industryTrailingPE") or info.get("sectorTrailingPE"),
             "revenue_growth": rev_growth,
             "earnings_growth": earn_growth
+        },
+    }
+
+    fundamentals_cache[symbol] = {"timestamp": time.time(), "data": payload}
+    return jsonify(payload)
         },
     })
 
