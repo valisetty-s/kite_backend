@@ -33,6 +33,8 @@ from urllib.parse import quote
 from time import mktime
 from datetime import datetime, timedelta
 from flask import request, jsonify
+import re
+from bs4 import BeautifulSoup
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -255,6 +257,138 @@ CRITICAL RULES FOR SENTIMENT CLASSIFICATION:
         return jsonify({"error": str(e)}), 500
 
 
+def _parse_screener_num(text):
+    if not text:
+        return None
+    cleaned = re.sub(r"[^\d.\-]", "", text.replace(",", ""))
+    try:
+        return float(cleaned) if cleaned else None
+    except ValueError:
+        return None
+
+
+def _fetch_screener_fundamentals(symbol):
+    """Scrapes public Screener.in page (consolidated first, then standalone)."""
+    clean_sym = re.sub(r"-(BE|SM|IL|BL|N1|N2)$", "", symbol.upper())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+
+    soup = None
+    for url in (
+        f"https://www.screener.in/company/{clean_sym}/consolidated/",
+        f"https://www.screener.in/company/{clean_sym}/",
+    ):
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp.status_code == 200:
+            candidate = BeautifulSoup(resp.text, "html.parser")
+            if candidate.select("#top-ratios li"):
+                soup = candidate
+                break
+
+    if not soup:
+        return None
+
+    # 1. Top Ratios (P/E, ROCE, ROE, Market Cap, Current Price, Book Value)
+    ratios = {}
+    for li in soup.select("#top-ratios li"):
+        name_el = li.select_one(".name")
+        val_el = li.select_one(".value")
+        if name_el and val_el:
+            ratios[name_el.get_text(strip=True)] = _parse_screener_num(val_el.get_text(" ", strip=True))
+
+    trailing_pe = ratios.get("Stock P/E")
+    roce = ratios["ROCE"] / 100.0 if ratios.get("ROCE") is not None else None
+    roe = ratios["ROE"] / 100.0 if ratios.get("ROE") is not None else None
+    curr_price = ratios.get("Current Price")
+    book_val = ratios.get("Book Value")
+    price_to_book = round(curr_price / book_val, 2) if (curr_price and book_val and book_val > 0) else None
+    market_cap = ratios["Market Cap"] * 1e7 if ratios.get("Market Cap") is not None else None  # Cr -> INR
+
+    # 2. Compounded Sales & Profit Growth (prefer TTM, fallback to 3 Years)
+    rev_growth = None
+    earn_growth = None
+    for table in soup.select("table.ranges-table"):
+        header_el = table.select_one("th")
+        if not header_el:
+            continue
+        title = header_el.get_text(strip=True)
+        rows = {}
+        for tr in table.select("tr")[1:]:
+            tds = tr.select("td")
+            if len(tds) == 2:
+                rows[tds[0].get_text(strip=True).rstrip(":")] = _parse_screener_num(tds[1].get_text(strip=True))
+        val = rows.get("TTM") if rows.get("TTM") is not None else rows.get("3 Years")
+        if "Sales Growth" in title and val is not None:
+            rev_growth = val / 100.0
+        elif "Profit Growth" in title and val is not None:
+            earn_growth = val / 100.0
+
+    # 3. Operating Margin (OPM %) from Profit & Loss (latest column)
+    operating_margin = None
+    pl_section = soup.select_one("#profit-loss")
+    if pl_section:
+        for tr in pl_section.select("tbody tr"):
+            tds = tr.select("td")
+            if tds and "OPM %" in tds[0].get_text(strip=True):
+                vals = [_parse_screener_num(td.get_text(strip=True)) for td in tds[1:]]
+                valid = [v for v in vals if v is not None]
+                if valid:
+                    operating_margin = valid[-1] / 100.0
+                break
+
+    # 4. Debt-to-Equity from Balance Sheet (Borrowings / (Equity Capital + Reserves))
+    debt_ratio = None
+    debt_to_equity = None
+    total_debt = None
+    bs_section = soup.select_one("#balance-sheet")
+    if bs_section:
+        bs_rows = {}
+        for tr in bs_section.select("tbody tr"):
+            tds = tr.select("td")
+            if len(tds) > 1:
+                label = tds[0].get_text(strip=True).replace("+", "").strip()
+                vals = [_parse_screener_num(td.get_text(strip=True)) for td in tds[1:]]
+                valid = [v for v in vals if v is not None]
+                if valid:
+                    bs_rows[label] = valid[-1]
+        borrowings = bs_rows.get("Borrowings")
+        eq_cap = bs_rows.get("Equity Capital", 0.0) or 0.0
+        reserves = bs_rows.get("Reserves", 0.0) or 0.0
+        net_worth = eq_cap + reserves
+        if borrowings is not None:
+            total_debt = borrowings * 1e7
+            if net_worth > 0:
+                debt_ratio = round(borrowings / net_worth, 2)
+                debt_to_equity = round(debt_ratio * 100, 2)  # Yahoo-compatible scale
+
+    # 5. Dynamic PEG Ratio
+    peg_ratio = None
+    if trailing_pe and trailing_pe > 0:
+        growth_for_peg = earn_growth if (earn_growth and earn_growth > 0) else rev_growth
+        if growth_for_peg and growth_for_peg > 0:
+            peg_ratio = round(trailing_pe / (growth_for_peg * 100), 2)
+
+    return {
+        "trailing_pe": trailing_pe,
+        "forward_pe": None,
+        "price_to_book": price_to_book,
+        "peg_ratio": peg_ratio,
+        "return_on_equity": roe,
+        "roce": roce,
+        "debt_to_equity": debt_to_equity,
+        "debt_ratio": debt_ratio,
+        "profit_margin": None,
+        "operating_margin": operating_margin,
+        "total_debt": total_debt,
+        "market_cap": market_cap,
+        "industry_pe": None,
+        "revenue_growth": rev_growth,
+        "earnings_growth": earn_growth,
+    }
+
+
 @app.route("/api/fundamentals", methods=["GET"])
 def fetch_fundamentals():
     symbol = request.args.get("symbol", "").strip().upper()
@@ -266,6 +400,22 @@ def fetch_fundamentals():
     if cached and (time.time() - cached["timestamp"] < 43200):
         return jsonify(cached["data"])
 
+    # 1. Try Screener.in first (no Yahoo 429 blocks, includes true ROCE & OPM)
+    try:
+        screener_data = _fetch_screener_fundamentals(symbol)
+        if screener_data:
+            payload = {
+                "status": "success",
+                "symbol": symbol,
+                "source": "screener",
+                "fundamentals": screener_data,
+            }
+            fundamentals_cache[symbol] = {"timestamp": time.time(), "data": payload}
+            return jsonify(payload)
+    except Exception as e:
+        print(f"Screener lookup failed for {symbol}: {e}")
+
+    # 2. Fallback to Yahoo Finance if Screener.in fails
     yahoo_symbol = _to_yahoo_symbol(symbol)
 
     def _blocking_fetch():
@@ -281,7 +431,6 @@ def fetch_fundamentals():
     except Exception as e:
         return jsonify({"error": f"Could not fetch fundamentals: {e}"}), 502
 
-    # Check multiple price keys so loss-making stocks don't trigger a 404
     has_price = any(info.get(k) is not None for k in ["currentPrice", "regularMarketPrice", "previousClose", "open"])
     if not info or not has_price:
         return jsonify({"error": f"No data found for {yahoo_symbol}"}), 404
@@ -290,7 +439,6 @@ def fetch_fundamentals():
     rev_growth = info.get("revenueGrowth")
     earn_growth = info.get("earningsGrowth")
 
-    # Use Yahoo's PEG if available; otherwise calculate it from Trailing P/E and Growth
     peg_ratio = info.get("trailingPegRatio") or info.get("pegRatio")
     if peg_ratio is None and trailing_pe and trailing_pe > 0:
         growth_for_peg = earn_growth if (earn_growth and earn_growth > 0) else rev_growth
@@ -300,6 +448,7 @@ def fetch_fundamentals():
     payload = {
         "status": "success",
         "symbol": symbol,
+        "source": "yahoo",
         "fundamentals": {
             "trailing_pe": trailing_pe,
             "forward_pe": info.get("forwardPE"),
@@ -319,6 +468,7 @@ def fetch_fundamentals():
 
     fundamentals_cache[symbol] = {"timestamp": time.time(), "data": payload}
     return jsonify(payload)
+
 
 
 @app.route("/api/fundamentals/roce", methods=["GET"])
