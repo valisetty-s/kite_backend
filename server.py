@@ -597,7 +597,7 @@ def _fetch_one_quote(yahoo_symbol):
     url = "https://query1.finance.yahoo.com/v8/finance/chart/" + yahoo_symbol
     hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
 
-    r = requests.get(url, headers=hdrs, params={"range": "3mo", "interval": "1d", "includePrePost": "false"}, timeout=12)
+    r = requests.get(url, headers=hdrs, params={"range": "1y", "interval": "1d", "includePrePost": "false"}, timeout=12)
     if r.status_code != 200:
         raise ValueError(f"Yahoo HTTP {r.status_code} for {yahoo_symbol}")
 
@@ -634,7 +634,6 @@ def _fetch_one_quote(yahoo_symbol):
             if bar_date < today_ist:
                 prev_close = c
                 break
-   
 
     change_pct = round(((last_price - prev_close) / prev_close) * 100, 2) if prev_close else None
     vol_series = [v for v in (q.get("volume") or []) if v is not None]
@@ -649,6 +648,11 @@ def _fetch_one_quote(yahoo_symbol):
     if wk52_high and wk52_low and last_price:
         near_52wk_flag = ("near-high" if last_price >= wk52_high * 0.98 else "near-low" if last_price <= wk52_low * 1.02 else None)
 
+    valid_closes = [c for c in raw_closes if c is not None and c > 0]
+    dma_20 = round(sum(valid_closes[-20:]) / 20, 2) if len(valid_closes) >= 20 else None
+    dma_50 = round(sum(valid_closes[-50:]) / 50, 2) if len(valid_closes) >= 50 else None
+    dma_200 = round(sum(valid_closes[-200:]) / 200, 2) if len(valid_closes) >= 200 else None
+
     return {
         "last_price": round(last_price, 2), "prev_close": round(prev_close, 2) if prev_close else None,
         "change_pct": change_pct, "volume": int(today_vol) if today_vol else None,
@@ -657,6 +661,9 @@ def _fetch_one_quote(yahoo_symbol):
         "fifty_two_wk_low": round(wk52_low, 2) if wk52_low else None,
         "fifty_two_wk_high": round(wk52_high, 2) if wk52_high else None,
         "near_52wk_flag": near_52wk_flag,
+        "dma_20": dma_20,
+        "dma_50": dma_50,
+        "dma_200": dma_200,
     }
 
 @app.route("/api/news", methods=["GET"])
