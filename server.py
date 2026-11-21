@@ -309,9 +309,13 @@ def _fetch_screener_fundamentals(symbol):
     price_to_book = round(curr_price / book_val, 2) if (curr_price and book_val and book_val > 0) else None
     market_cap = ratios["Market Cap"] * 1e7 if ratios.get("Market Cap") is not None else None  # Cr -> INR
 
-    # 2. Compounded Sales & Profit Growth (prefer TTM, fallback to 3 Years)
+    # 2. Compounded Sales & Profit Growth
+    # Display TTM (fallback to 3 Years) for Rev/PAT so turnarounds show up immediately,
+    # while keeping 3-Year CAGR for PEG calculation to avoid turnaround base-effect distortions.
     rev_growth = None
     earn_growth = None
+    rev_growth_3y = None
+    earn_growth_3y = None
     for table in soup.select("table.ranges-table"):
         header_el = table.select_one("th")
         if not header_el:
@@ -322,11 +326,19 @@ def _fetch_screener_fundamentals(symbol):
             tds = tr.select("td")
             if len(tds) == 2:
                 rows[tds[0].get_text(strip=True).rstrip(":")] = _parse_screener_num(tds[1].get_text(strip=True))
-        val = rows.get("3 Years") if rows.get("3 Years") is not None else rows.get("TTM")
-        if "Sales Growth" in title and val is not None:
-            rev_growth = val / 100.0
-        elif "Profit Growth" in title and val is not None:
-            earn_growth = val / 100.0
+        ttm_val = rows.get("TTM")
+        y3_val = rows.get("3 Years")
+        display_val = ttm_val if ttm_val is not None else y3_val
+        if "Sales Growth" in title:
+            if display_val is not None:
+                rev_growth = display_val / 100.0
+            if y3_val is not None:
+                rev_growth_3y = y3_val / 100.0
+        elif "Profit Growth" in title:
+            if display_val is not None:
+                earn_growth = display_val / 100.0
+            if y3_val is not None:
+                earn_growth_3y = y3_val / 100.0
 
     # 3. Operating Margin (OPM %) & Operating Profit (EBITDA) from Profit & Loss
     operating_margin = None
@@ -412,11 +424,15 @@ def _fetch_screener_fundamentals(symbol):
         if (fixed_asset_ratio is not None and fixed_asset_ratio >= 0.40) or (cwip_ratio is not None and cwip_ratio >= 0.15):
             is_capex_heavy = True
 
-    # 5. Dynamic PEG Ratio
+    # 5. Dynamic PEG Ratio (prefer 3-Year CAGR; fallback to TTM only if 3Y is missing/negative)
     peg_ratio = None
     if trailing_pe and trailing_pe > 0:
-        growth_for_peg = earn_growth if (earn_growth and earn_growth > 0) else rev_growth
-        if growth_for_peg and growth_for_peg > 0:
+        growth_for_peg = None
+        for candidate in (earn_growth_3y, rev_growth_3y, earn_growth, rev_growth):
+            if candidate is not None and candidate > 0:
+                growth_for_peg = candidate
+                break
+        if growth_for_peg:
             peg_ratio = round(trailing_pe / (growth_for_peg * 100), 2)
 
     return {
