@@ -309,11 +309,9 @@ def _fetch_screener_fundamentals(symbol):
     price_to_book = round(curr_price / book_val, 2) if (curr_price and book_val and book_val > 0) else None
     market_cap = ratios["Market Cap"] * 1e7 if ratios.get("Market Cap") is not None else None  # Cr -> INR
 
-    # 2. Compounded Sales & Profit Growth
-    # Display TTM (fallback to 3 Years) for Rev/PAT so turnarounds show up immediately,
-    # while keeping 3-Year CAGR for PEG calculation to avoid turnaround base-effect distortions.
-    rev_growth = None
-    earn_growth = None
+    # 2. Compounded Sales & Profit Growth (TTM & 3-Year CAGR from ranges-table)
+    rev_growth_ttm = None
+    earn_growth_ttm = None
     rev_growth_3y = None
     earn_growth_3y = None
     for table in soup.select("table.ranges-table"):
@@ -328,17 +326,42 @@ def _fetch_screener_fundamentals(symbol):
                 rows[tds[0].get_text(strip=True).rstrip(":")] = _parse_screener_num(tds[1].get_text(strip=True))
         ttm_val = rows.get("TTM")
         y3_val = rows.get("3 Years")
-        display_val = ttm_val if ttm_val is not None else y3_val
         if "Sales Growth" in title:
-            if display_val is not None:
-                rev_growth = display_val / 100.0
+            if ttm_val is not None:
+                rev_growth_ttm = ttm_val / 100.0
             if y3_val is not None:
                 rev_growth_3y = y3_val / 100.0
         elif "Profit Growth" in title:
-            if display_val is not None:
-                earn_growth = display_val / 100.0
+            if ttm_val is not None:
+                earn_growth_ttm = ttm_val / 100.0
             if y3_val is not None:
                 earn_growth_3y = y3_val / 100.0
+
+    # 2b. Last 2 Quarters YoY Growth from #quarters table: (Q0 + Q-1) vs (Q-4 + Q-5)
+    rev_growth_2q = None
+    earn_growth_2q = None
+    q_section = soup.select_one("#quarters")
+    if q_section:
+        for tr in q_section.select("tbody tr"):
+            tds = tr.select("td")
+            if not tds:
+                continue
+            label = tds[0].get_text(strip=True).replace("+", "").strip()
+            vals = [_parse_screener_num(td.get_text(strip=True)) for td in tds[1:]]
+            # Need at least 6 quarters (indices -1, -2 vs -5, -6)
+            if len(vals) >= 6 and all(vals[i] is not None for i in (-1, -2, -5, -6)):
+                curr_2q = vals[-1] + vals[-2]
+                prev_2q = vals[-5] + vals[-6]
+                if prev_2q > 0:
+                    yoy_2q = round((curr_2q - prev_2q) / prev_2q, 4)
+                    if label in ("Sales", "Revenue"):
+                        rev_growth_2q = yoy_2q
+                    elif label == "Net Profit":
+                        earn_growth_2q = yoy_2q
+
+    # Prefer Last 2Q YoY for display, sorting & Analytics buckets; fallback to TTM -> 3Y
+    rev_growth = rev_growth_2q if rev_growth_2q is not None else (rev_growth_ttm if rev_growth_ttm is not None else rev_growth_3y)
+    earn_growth = earn_growth_2q if earn_growth_2q is not None else (earn_growth_ttm if earn_growth_ttm is not None else earn_growth_3y)
 
     # 3. Operating Margin (OPM %) & Operating Profit (EBITDA) from Profit & Loss
     operating_margin = None
@@ -424,19 +447,20 @@ def _fetch_screener_fundamentals(symbol):
         if (fixed_asset_ratio is not None and fixed_asset_ratio >= 0.40) or (cwip_ratio is not None and cwip_ratio >= 0.15):
             is_capex_heavy = True
 
-   # 5. Dynamic PEG Ratio (prefer 3-Year CAGR; skip extreme >150% turnaround TTM PAT spikes)
+    # 5. Dynamic PEG Ratio (prefer 3-Year CAGR; skip extreme >150% turnaround spikes)
     peg_ratio = None
     if trailing_pe and trailing_pe > 0:
         growth_for_peg = None
         candidates = [
             earn_growth_3y,
             rev_growth_3y,
-            earn_growth if (earn_growth is not None and earn_growth <= 1.50) else None,
+            earn_growth_ttm if (earn_growth_ttm is not None and earn_growth_ttm <= 1.50) else None,
+            rev_growth_ttm,
             rev_growth,
         ]
         for candidate in candidates:
             if candidate is not None and candidate > 0:
-                growth_for_peg = min(candidate, 1.50)  # Cap denominator at 150%
+                growth_for_peg = min(candidate, 1.50)
                 break
         if growth_for_peg:
             val = round(trailing_pe / (growth_for_peg * 100), 2)
