@@ -424,16 +424,23 @@ def _fetch_screener_fundamentals(symbol):
         if (fixed_asset_ratio is not None and fixed_asset_ratio >= 0.40) or (cwip_ratio is not None and cwip_ratio >= 0.15):
             is_capex_heavy = True
 
-    # 5. Dynamic PEG Ratio (prefer 3-Year CAGR; fallback to TTM only if 3Y is missing/negative)
+   # 5. Dynamic PEG Ratio (prefer 3-Year CAGR; skip extreme >150% turnaround TTM PAT spikes)
     peg_ratio = None
     if trailing_pe and trailing_pe > 0:
         growth_for_peg = None
-        for candidate in (earn_growth_3y, rev_growth_3y, earn_growth, rev_growth):
+        candidates = [
+            earn_growth_3y,
+            rev_growth_3y,
+            earn_growth if (earn_growth is not None and earn_growth <= 1.50) else None,
+            rev_growth,
+        ]
+        for candidate in candidates:
             if candidate is not None and candidate > 0:
-                growth_for_peg = candidate
+                growth_for_peg = min(candidate, 1.50)  # Cap denominator at 150%
                 break
         if growth_for_peg:
-            peg_ratio = round(trailing_pe / (growth_for_peg * 100), 2)
+            val = round(trailing_pe / (growth_for_peg * 100), 2)
+            peg_ratio = val if val > 0 else None
 
     return {
         "trailing_pe": trailing_pe,
