@@ -217,6 +217,9 @@ def ai_briefing():
     symbol = body.get("symbol", "").strip()
     company = body.get("company", "").strip()
     tier = body.get("tier", "Watch").strip()
+    garp_score = body.get("garp_score")
+    trend = body.get("trend", "unknown")
+    action_signal = body.get("action_signal")
     fundamentals = body.get("fundamentals", {})
     news = body.get("news", [])
 
@@ -225,28 +228,28 @@ def ai_briefing():
 
     fund_str = json.dumps(fundamentals) if fundamentals else "Live metrics unavailable"
 
-    prompt = f"Analyze Indian stock {company} ({symbol}) for an equity investor based on the data below:\n"
-    prompt += f"Portfolio Classification Tier: {tier} (Context: Top30=Accumulate, Top31-50=Hold, Top51-75=Trim, Watch=High Risk / Speculative / Exit)\n"
-    prompt += f"Reported Fundamentals: {fund_str}\n"
+    prompt = f"You are an institutional equity research assistant doing a fast Thesis-Check on Indian stock {company} ({symbol}).\n"
+    prompt += f"Dashboard Signals: GARP Score={garp_score}/100 | Trend={trend} | Action Signal={action_signal or 'None'} | Tier={tier}\n"
+    prompt += f"Screener Fundamentals: {fund_str}\n"
     prompt += "Recent News Headlines:\n"
-    for n in news[:5]:
-        prompt += f"- {n.get('title')}\n"
+    if news:
+        for n in news[:5]:
+            prompt += f"- {n.get('title')}\n"
+    else:
+        prompt += "- No recent headlines found.\n"
 
     prompt += """
 Provide a structured JSON response EXACTLY matching this schema:
 {
+  "news_materiality": "HIGH or LOW",
   "business_summary": "1 concise sentence explaining what the company produces or does.",
-  "financial_health": "1 concise sentence evaluating solvency, valuation, debt, and profitability.",
-  "sentiment": "BULLISH, BEARISH, or NOISE",
-  "key_catalyst": "1 concise sentence on the most impactful recent catalyst or development.",
-  "key_risk": "1 concise sentence on primary solvency, debt, margin, or operational risks."
+  "what_changed": "1 concise sentence summarizing ONLY material news (earnings, order wins, capex, regulatory/governance action). If headlines are routine price chatter or empty, state 'No material thesis-changing news in recent headlines.'",
+  "key_watchpoint": "1 specific, actionable watchpoint grounded in the actual numbers provided (e.g. stretched PEG, weak CFO/EBITDA <50%, heavy CWIP/capex execution, debt, or broken 200-DMA trend)."
 }
 
-CRITICAL RULES FOR SENTIMENT CLASSIFICATION:
-1. Synthesize verified fundamentals, recent headlines, and established company knowledge.
-2. For stocks in the 'Watch' tier, or companies with known heavy debt, ongoing insolvency disputes, or negative net worth, DO NOT mark sentiment as BULLISH based on short-term capacity gains or promotional headlines. Classify them as BEARISH or NOISE.
-3. For sound, growing, profitable companies (especially in Top30 or Top31-50 tiers) with positive momentum or contract wins, classify as BULLISH.
-4. If news is minor, promotional, or inconclusive, classify as NOISE.
+RULES:
+- Set news_materiality to "HIGH" ONLY if headlines contain earnings results, major contract/order wins, capex/expansion milestones, M&A, promoter/governance flags, or regulatory actions. Otherwise set "LOW".
+- Do NOT invent numbers. Reference the provided fundamentals (P/E, PEG, ROCE, OPM, CFO/EBITDA, Capex/CWIP) when writing key_watchpoint.
 """
     try:
         response_text = call_gemini(prompt)
