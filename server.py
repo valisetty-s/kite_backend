@@ -325,23 +325,58 @@ def _fetch_screener_fundamentals(symbol):
         elif "Profit Growth" in title and val is not None:
             earn_growth = val / 100.0
 
-    # 3. Operating Margin (OPM %) from Profit & Loss (latest column)
+    # 3. Operating Margin (OPM %) & Operating Profit (EBITDA) from Profit & Loss
     operating_margin = None
+    ebitda_3y_vals = []
     pl_section = soup.select_one("#profit-loss")
     if pl_section:
+        pl_headers = [th.get_text(strip=True).upper() for th in pl_section.select("thead th")][1:]
+        has_ttm = bool(pl_headers and "TTM" in pl_headers[-1])
         for tr in pl_section.select("tbody tr"):
             tds = tr.select("td")
-            if tds and "OPM %" in tds[0].get_text(strip=True):
+            if not tds:
+                continue
+            row_label = tds[0].get_text(strip=True).replace("+", "").strip()
+            if "OPM %" in row_label:
                 vals = [_parse_screener_num(td.get_text(strip=True)) for td in tds[1:]]
                 valid = [v for v in vals if v is not None]
                 if valid:
                     operating_margin = valid[-1] / 100.0
+            elif row_label == "Operating Profit":
+                # Excludes Banks/NBFCs (which use "Financing Profit") and excludes TTM column
+                raw_tds = tds[1:-1] if has_ttm else tds[1:]
+                vals = [_parse_screener_num(td.get_text(strip=True)) for td in raw_tds]
+                valid = [v for v in vals if v is not None]
+                if len(valid) >= 2:
+                    ebitda_3y_vals = valid[-3:]
+
+    # 3b. 3-Year Cumulative CFO / EBITDA from Cash Flow Statement
+    cfo_to_ebitda = None
+    cf_section = soup.select_one("#cash-flow")
+    if cf_section and ebitda_3y_vals:
+        for tr in cf_section.select("tbody tr"):
+            tds = tr.select("td")
+            if not tds:
+                continue
+            row_label = tds[0].get_text(strip=True).replace("+", "").strip()
+            if "Cash from Operating Activity" in row_label:
+                vals = [_parse_screener_num(td.get_text(strip=True)) for td in tds[1:]]
+                valid = [v for v in vals if v is not None]
+                n = min(len(valid), len(ebitda_3y_vals))
+                if n >= 2:
+                    cfo_sum = sum(valid[-n:])
+                    ebitda_sum = sum(ebitda_3y_vals[-n:])
+                    if ebitda_sum > 0:
+                        cfo_to_ebitda = round(cfo_sum / ebitda_sum, 2)
                 break
 
-    # 4. Debt-to-Equity from Balance Sheet (Borrowings / (Equity Capital + Reserves))
+    # 4. Balance Sheet: Debt-to-Equity & Capex-Heavy Indicators
     debt_ratio = None
     debt_to_equity = None
     total_debt = None
+    fixed_asset_ratio = None
+    cwip_ratio = None
+    is_capex_heavy = False
     bs_section = soup.select_one("#balance-sheet")
     if bs_section:
         bs_rows = {}
@@ -362,6 +397,17 @@ def _fetch_screener_fundamentals(symbol):
             if net_worth > 0:
                 debt_ratio = round(borrowings / net_worth, 2)
                 debt_to_equity = round(debt_ratio * 100, 2)  # Yahoo-compatible scale
+
+        # Capex-Heavy check: (Fixed Assets + CWIP) / Total Assets >= 40% OR CWIP / Fixed Assets >= 15%
+        fixed_assets = bs_rows.get("Fixed Assets", 0.0) or 0.0
+        cwip = bs_rows.get("CWIP", 0.0) or 0.0
+        total_assets = bs_rows.get("Total Assets")
+        if total_assets and total_assets > 0:
+            fixed_asset_ratio = round((fixed_assets + cwip) / total_assets, 2)
+        if fixed_assets > 0 and cwip > 0:
+            cwip_ratio = round(cwip / fixed_assets, 2)
+        if (fixed_asset_ratio is not None and fixed_asset_ratio >= 0.40) or (cwip_ratio is not None and cwip_ratio >= 0.15):
+            is_capex_heavy = True
 
     # 5. Dynamic PEG Ratio
     peg_ratio = None
@@ -386,6 +432,10 @@ def _fetch_screener_fundamentals(symbol):
         "industry_pe": None,
         "revenue_growth": rev_growth,
         "earnings_growth": earn_growth,
+        "cfo_to_ebitda": cfo_to_ebitda,
+        "fixed_asset_ratio": fixed_asset_ratio,
+        "cwip_ratio": cwip_ratio,
+        "is_capex_heavy": is_capex_heavy,
     }
 
 
