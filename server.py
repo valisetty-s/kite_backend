@@ -2,13 +2,14 @@
 server.py — The Morning Ledger's backend
 
 Endpoints:
-  1. POST /api/kite/exchange — Completes Kite Connect OAuth.
-  2. GET /api/news — Fetches Google News RSS for one company.
-  3. GET /api/quotes — Returns live price and % change from Yahoo Finance.
-  4. GET /api/fundamentals — Returns trailing PE, P/B, Debt, etc.
-  5. GET /api/fundamentals/roce — Returns ROCE & Debt Ratio calculated from balance sheets.
-  6. GET /api/market/global-cues — Overnight macro cues synthesized by Gemini.
-  7. POST /api/ai/briefing — Single-stock 1-minute AI briefing using Gemini.
+  1. POST /api/kite/exchange — Completes Kite Connect OAuth (multi-profile).
+  2. GET /api/groww/holdings — Fetches Groww holdings (multi-profile).
+  3. GET /api/news — Fetches Google News RSS for one company.
+  4. GET /api/quotes — Returns live price and % change from Yahoo Finance.
+  5. GET /api/fundamentals — Returns trailing PE, P/B, Debt, ROCE, OPM, CFO/EBITDA, Capex/CWIP.
+  6. GET /api/fundamentals/roce — Returns ROCE & Debt Ratio calculated from balance sheets.
+  7. GET /api/market/global-cues — Overnight macro cues synthesized by Gemini.
+  8. POST /api/ai/briefing — Single-stock 1-minute AI briefing using Gemini.
 """
 
 import hashlib
@@ -17,23 +18,16 @@ import logging
 import sys
 import json
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from urllib.parse import quote
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import feedparser
 import requests
 import yfinance as yf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-
-import feedparser
-import requests
-from urllib.parse import quote
-from time import mktime
-from datetime import datetime, timedelta
-from flask import request, jsonify
-import re
 from bs4 import BeautifulSoup
 
 logging.basicConfig(
@@ -49,29 +43,58 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-KITE_API_KEY = os.environ.get("KITE_API_KEY", "")
-KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+KITE_API_KEY = os.environ.get("KITE_API_KEY", "").strip()
+KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 KITE_SESSION_TOKEN_URL = "https://api.kite.trade/session/token"
 KITE_HOLDINGS_URL = "https://api.kite.trade/portfolio/holdings"
+
+# In-memory session store per profile: { "self": {"access_token": ..., "api_key": ...}, "wife": ... }
+profile_sessions = {}
+
+
+def _normalize_profile(raw_profile):
+    p = (raw_profile or "self").strip().lower()
+    if p in ("spouse", "wife", "deepthi"):
+        return "wife"
+    if p in ("self", "satish"):
+        return "self"
+    return re.sub(r"[^a-z0-9_-]", "_", p) or "self"
+
+
+def _resolve_kite_credentials(profile="self"):
+    p_norm = _normalize_profile(profile)
+    p_upper = p_norm.upper()
+
+    api_key = (
+        os.environ.get(f"KITE_API_KEY_{p_upper}", "").strip()
+        or (os.environ.get("KITE_API_KEY_SELF", "").strip() if p_norm == "self" else "")
+        or KITE_API_KEY
+    )
+    api_secret = (
+        os.environ.get(f"KITE_API_SECRET_{p_upper}", "").strip()
+        or (os.environ.get("KITE_API_SECRET_SELF", "").strip() if p_norm == "self" else "")
+        or KITE_API_SECRET
+    )
+    return p_norm, api_key, api_secret
+
 
 NEWS_FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# Known aggregators/bots that frequently recycle old news with today's date
-# Expanded list of known aggregators/bots that frequently recycle old news
 UNK_SOURCES = [
-    "simply wall st", "zacks", "investorplace", "tipranks", 
-    "motley fool", "dsij", "dalal street investment journal", 
-    "tradingview", "goodreturns", "good returns", "scanx", 
+    "simply wall st", "zacks", "investorplace", "tipranks",
+    "motley fool", "dsij", "dalal street investment journal",
+    "tradingview", "goodreturns", "good returns", "scanx",
     "scanx.trade", "equitybulls", "capital market"
 ]
 
 global_cues_cache = {"timestamp": 0, "data": None}
 fundamentals_cache = {}  # { symbol: {"timestamp": float, "data": dict} }
+
 
 def call_gemini(prompt):
     """
@@ -293,7 +316,6 @@ def _fetch_screener_fundamentals(symbol):
     if not soup:
         return None
 
-    # 1. Top Ratios (P/E, ROCE, ROE, Market Cap, Current Price, Book Value)
     ratios = {}
     for li in soup.select("#top-ratios li"):
         name_el = li.select_one(".name")
@@ -307,9 +329,8 @@ def _fetch_screener_fundamentals(symbol):
     curr_price = ratios.get("Current Price")
     book_val = ratios.get("Book Value")
     price_to_book = round(curr_price / book_val, 2) if (curr_price and book_val and book_val > 0) else None
-    market_cap = ratios["Market Cap"] * 1e7 if ratios.get("Market Cap") is not None else None  # Cr -> INR
+    market_cap = ratios["Market Cap"] * 1e7 if ratios.get("Market Cap") is not None else None
 
-    # 2. Compounded Sales & Profit Growth (TTM & 3-Year CAGR from ranges-table)
     rev_growth_ttm = None
     earn_growth_ttm = None
     rev_growth_3y = None
@@ -337,7 +358,6 @@ def _fetch_screener_fundamentals(symbol):
             if y3_val is not None:
                 earn_growth_3y = y3_val / 100.0
 
-    # 2b. Last 2 Quarters YoY Growth from #quarters table: (Q0 + Q-1) vs (Q-4 + Q-5)
     rev_growth_2q = None
     earn_growth_2q = None
     q_section = soup.select_one("#quarters")
@@ -348,7 +368,6 @@ def _fetch_screener_fundamentals(symbol):
                 continue
             label = tds[0].get_text(strip=True).replace("+", "").strip()
             vals = [_parse_screener_num(td.get_text(strip=True)) for td in tds[1:]]
-            # Need at least 6 quarters (indices -1, -2 vs -5, -6)
             if len(vals) >= 6 and all(vals[i] is not None for i in (-1, -2, -5, -6)):
                 curr_2q = vals[-1] + vals[-2]
                 prev_2q = vals[-5] + vals[-6]
@@ -359,11 +378,9 @@ def _fetch_screener_fundamentals(symbol):
                     elif label == "Net Profit":
                         earn_growth_2q = yoy_2q
 
-    # Prefer Last 2Q YoY for display, sorting & Analytics buckets; fallback to TTM -> 3Y
     rev_growth = rev_growth_2q if rev_growth_2q is not None else (rev_growth_ttm if rev_growth_ttm is not None else rev_growth_3y)
     earn_growth = earn_growth_2q if earn_growth_2q is not None else (earn_growth_ttm if earn_growth_ttm is not None else earn_growth_3y)
 
-    # 3. Operating Margin (OPM %) & Operating Profit (EBITDA) from Profit & Loss
     operating_margin = None
     ebitda_3y_vals = []
     pl_section = soup.select_one("#profit-loss")
@@ -381,14 +398,12 @@ def _fetch_screener_fundamentals(symbol):
                 if valid:
                     operating_margin = valid[-1] / 100.0
             elif row_label == "Operating Profit":
-                # Excludes Banks/NBFCs (which use "Financing Profit") and excludes TTM column
                 raw_tds = tds[1:-1] if has_ttm else tds[1:]
                 vals = [_parse_screener_num(td.get_text(strip=True)) for td in raw_tds]
                 valid = [v for v in vals if v is not None]
                 if len(valid) >= 2:
                     ebitda_3y_vals = valid[-3:]
 
-    # 3b. 3-Year Cumulative CFO / EBITDA from Cash Flow Statement
     cfo_to_ebitda = None
     cf_section = soup.select_one("#cash-flow")
     if cf_section and ebitda_3y_vals:
@@ -408,7 +423,6 @@ def _fetch_screener_fundamentals(symbol):
                         cfo_to_ebitda = round(cfo_sum / ebitda_sum, 2)
                 break
 
-    # 4. Balance Sheet: Debt-to-Equity & Capex-Heavy Indicators
     debt_ratio = None
     debt_to_equity = None
     total_debt = None
@@ -434,9 +448,8 @@ def _fetch_screener_fundamentals(symbol):
             total_debt = borrowings * 1e7
             if net_worth > 0:
                 debt_ratio = round(borrowings / net_worth, 2)
-                debt_to_equity = round(debt_ratio * 100, 2)  # Yahoo-compatible scale
+                debt_to_equity = round(debt_ratio * 100, 2)
 
-        # Capex-Heavy check: (Fixed Assets + CWIP) / Total Assets >= 40% OR CWIP / Fixed Assets >= 15%
         fixed_assets = bs_rows.get("Fixed Assets", 0.0) or 0.0
         cwip = bs_rows.get("CWIP", 0.0) or 0.0
         total_assets = bs_rows.get("Total Assets")
@@ -447,7 +460,6 @@ def _fetch_screener_fundamentals(symbol):
         if (fixed_asset_ratio is not None and fixed_asset_ratio >= 0.40) or (cwip_ratio is not None and cwip_ratio >= 0.15):
             is_capex_heavy = True
 
-    # 5. Dynamic PEG Ratio (prefer 3-Year CAGR; skip extreme >150% turnaround spikes)
     peg_ratio = None
     if trailing_pe and trailing_pe > 0:
         growth_for_peg = None
@@ -495,12 +507,10 @@ def fetch_fundamentals():
     if not symbol:
         return jsonify({"error": "symbol query parameter is required"}), 400
 
-    # Return cached fundamentals if less than 12 hours old
     cached = fundamentals_cache.get(symbol)
     if cached and (time.time() - cached["timestamp"] < 43200):
         return jsonify(cached["data"])
 
-    # 1. Try Screener.in first (no Yahoo 429 blocks, includes true ROCE & OPM)
     try:
         screener_data = _fetch_screener_fundamentals(symbol)
         if screener_data:
@@ -515,7 +525,6 @@ def fetch_fundamentals():
     except Exception as e:
         print(f"Screener lookup failed for {symbol}: {e}")
 
-    # 2. Fallback to Yahoo Finance if Screener.in fails
     yahoo_symbol = _to_yahoo_symbol(symbol)
 
     def _blocking_fetch():
@@ -568,7 +577,6 @@ def fetch_fundamentals():
 
     fundamentals_cache[symbol] = {"timestamp": time.time(), "data": payload}
     return jsonify(payload)
-
 
 
 @app.route("/api/fundamentals/roce", methods=["GET"])
@@ -718,18 +726,18 @@ def _fetch_one_quote(yahoo_symbol):
     if last_price is None:
         raise ValueError(f"No price for {yahoo_symbol}")
 
-    from datetime import datetime, timedelta, timezone
     IST = timezone(timedelta(hours=5, minutes=30))
     today_ist = datetime.now(IST).date()
     raw_closes = q.get("close") or []
     prev_close = meta.get("regularMarketPreviousClose") or meta.get("previousClose")
 
-    # If Yahoo's meta previousClose is missing, grab the last completed trading day before today
     if not prev_close:
         for i in range(len(timestamps) - 1, -1, -1):
-            if i >= len(raw_closes): continue
+            if i >= len(raw_closes):
+                continue
             c = raw_closes[i]
-            if c is None or c == 0: continue
+            if c is None or c == 0:
+                continue
             bar_date = datetime.fromtimestamp(timestamps[i], tz=IST).date()
             if bar_date < today_ist:
                 prev_close = c
@@ -766,19 +774,13 @@ def _fetch_one_quote(yahoo_symbol):
         "dma_200": dma_200,
     }
 
+
 @app.route("/api/news", methods=["GET"])
 def fetch_news_for_company():
-    # 1. Self-contained imports to prevent server crashes
-    import datetime
-    from urllib.parse import quote
-    import feedparser
-    import requests
-
-    # 2. Aggressive spam filter for metadata-bumpers
     JUNK_SOURCES = [
-        "simply wall st", "zacks", "investorplace", "tipranks", 
-        "motley fool", "dsij", "dalal street investment journal", 
-        "tradingview", "goodreturns", "good returns", "scanx", 
+        "simply wall st", "zacks", "investorplace", "tipranks",
+        "motley fool", "dsij", "dalal street investment journal",
+        "tradingview", "goodreturns", "good returns", "scanx",
         "scanx.trade", "equitybulls", "capital market"
     ]
 
@@ -790,7 +792,6 @@ def fetch_news_for_company():
     rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
 
     try:
-        # Uses your existing globally defined NEWS_FETCH_HEADERS
         resp = requests.get(rss_url, headers=NEWS_FETCH_HEADERS, timeout=12)
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Could not reach Google News: {e}"}), 502
@@ -807,7 +808,7 @@ def fetch_news_for_company():
         return jsonify({"error": f"Could not parse RSS response: {e}"}), 502
 
     articles = []
-    now_utc = datetime.datetime.utcnow()
+    now_utc = datetime.utcnow()
 
     for entry in parsed.entries:
         if len(articles) >= 5:
@@ -820,19 +821,17 @@ def fetch_news_for_company():
             title = raw_title[:sep_idx].strip()
             source = raw_title[sep_idx + 3:].strip()
 
-        # Spam Filter: Skip known automated aggregator bots
         if any(junk in source.lower() for junk in JUNK_SOURCES):
             continue
 
-        # Safe Date Filter: Only drop if we can mathematically prove it's > 14 days old
         published_parsed = entry.get("published_parsed")
         if published_parsed:
             try:
-                article_dt = datetime.datetime(*published_parsed[:6])
-                if now_utc - article_dt > datetime.timedelta(days=14):
+                article_dt = datetime(*published_parsed[:6])
+                if now_utc - article_dt > timedelta(days=14):
                     continue
             except Exception:
-                pass  # Fallback: keep article if date parsing behaves weirdly
+                pass
 
         articles.append({
             "title": title,
@@ -849,23 +848,117 @@ def fetch_news_for_company():
     })
 
 
+@app.route("/api/groww/holdings", methods=["GET"])
+def fetch_groww_holdings():
+    profile = _normalize_profile(request.args.get("profile"))
+    p_upper = profile.upper()
+    groww_token = (
+        os.environ.get(f"GROWW_API_TOKEN_{p_upper}", "").strip()
+        or os.environ.get(f"GROWW_ACCESS_TOKEN_{p_upper}", "").strip()
+        or os.environ.get("GROWW_API_TOKEN", "").strip()
+        or os.environ.get("GROWW_ACCESS_TOKEN", "").strip()
+    )
+
+    if not groww_token:
+        return jsonify({
+            "status": "error",
+            "profile": profile,
+            "broker": "groww",
+            "error": f"Groww token not configured on Render for profile '{profile}'. Set GROWW_API_TOKEN_{p_upper}."
+        }), 400
+
+    groww_url = os.environ.get("GROWW_HOLDINGS_URL", "https://api.groww.in/v1/holdings/user").strip()
+    try:
+        g_resp = requests.get(
+            groww_url,
+            headers={
+                "Authorization": f"Bearer {groww_token}",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            },
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
+        return jsonify({"status": "error", "profile": profile, "broker": "groww", "error": f"Could not reach Groww API: {e}"}), 502
+
+    if g_resp.status_code != 200:
+        return jsonify({
+            "status": "error",
+            "profile": profile,
+            "broker": "groww",
+            "error": f"Groww API returned HTTP {g_resp.status_code}",
+            "groww_response": g_resp.text[:300],
+        }), 400
+
+    try:
+        payload = g_resp.json()
+    except ValueError:
+        return jsonify({"status": "error", "profile": profile, "broker": "groww", "error": "Invalid JSON from Groww API"}), 502
+
+    raw_items = (
+        payload.get("holdings")
+        or payload.get("data", {}).get("holdings")
+        or (payload.get("data") if isinstance(payload.get("data"), list) else [])
+        or []
+    )
+    simplified = []
+    for h in raw_items:
+        if not isinstance(h, dict):
+            continue
+        sym = (h.get("trading_symbol") or h.get("tradingsymbol") or h.get("symbol") or h.get("ticker") or "").strip().upper()
+        if not sym:
+            continue
+        qty = float(h.get("quantity") or h.get("qty") or 0)
+        avg = float(h.get("average_price") or h.get("avg_price") or h.get("avgPrice") or 0)
+        ltp = float(h.get("last_price") or h.get("ltp") or 0)
+        simplified.append({
+            "ticker": sym,
+            "company": h.get("company_name") or h.get("name") or sym,
+            "quantity": qty,
+            "average_price": avg,
+            "last_price": ltp,
+            "pnl": round((ltp - avg) * qty, 2) if ltp and avg else 0,
+        })
+
+    return jsonify({
+        "status": "success",
+        "profile": profile,
+        "broker": "groww",
+        "count": len(simplified),
+        "holdings": simplified,
+    })
+
+
 @app.route("/api/kite/exchange", methods=["POST"])
 def exchange_and_fetch_holdings():
-    if not KITE_API_KEY or not KITE_API_SECRET:
-        return jsonify({"error": "Missing KITE_API_KEY / KITE_API_SECRET"}), 500
-
     body = request.get_json(silent=True) or {}
     request_token = body.get("request_token", "").strip()
     if not request_token:
         return jsonify({"error": "request_token is required"}), 400
 
-    checksum = hashlib.sha256((KITE_API_KEY + request_token + KITE_API_SECRET).encode("utf-8")).hexdigest()
+    profile_norm, active_key, active_secret = _resolve_kite_credentials(body.get("profile"))
+    broker_name = (body.get("broker") or "kite").strip().lower()
+
+    if not active_key or not active_secret:
+        return jsonify({
+            "error": f"Missing Kite API key / secret for profile '{profile_norm}'. Set KITE_API_KEY_{profile_norm.upper()} and KITE_API_SECRET_{profile_norm.upper()} on Render."
+        }), 500
+
+    logger.info(
+        "Kite token exchange: profile=%s broker=%s key_prefix=%s secret_len=%d",
+        profile_norm,
+        broker_name,
+        active_key[:6],
+        len(active_secret),
+    )
+
+    checksum = hashlib.sha256((active_key + request_token + active_secret).encode("utf-8")).hexdigest()
 
     try:
         token_resp = requests.post(
             KITE_SESSION_TOKEN_URL,
             headers={"X-Kite-Version": "3"},
-            data={"api_key": KITE_API_KEY, "request_token": request_token, "checksum": checksum},
+            data={"api_key": active_key, "request_token": request_token, "checksum": checksum},
             timeout=15,
         )
     except requests.exceptions.RequestException as e:
@@ -877,16 +970,33 @@ def exchange_and_fetch_holdings():
         return jsonify({"error": "Kite returned invalid JSON during exchange."}), 502
 
     if token_resp.status_code != 200 or token_data.get("status") != "success":
-        return jsonify({"error": "Kite rejected the token exchange.", "kite_response": token_data}), 400
+        logger.warning(
+            "Kite token exchange rejected (%s) for profile=%s key_prefix=%s: %s",
+            token_resp.status_code,
+            profile_norm,
+            active_key[:6],
+            token_data,
+        )
+        return jsonify({
+            "error": f"Kite rejected the token exchange (HTTP {token_resp.status_code}) for profile '{profile_norm}' using key '{active_key[:6]}...'. Verify this API key & secret belong to the Zerodha account logging in and have not expired.",
+            "profile": profile_norm,
+            "kite_response": token_data,
+        }), 400
 
     access_token = token_data.get("data", {}).get("access_token")
     if not access_token:
         return jsonify({"error": "Missing access_token."}), 502
 
+    profile_sessions[profile_norm] = {
+        "access_token": access_token,
+        "api_key": active_key,
+        "updated_at": time.time(),
+    }
+
     try:
         holdings_resp = requests.get(
             KITE_HOLDINGS_URL,
-            headers={"X-Kite-Version": "3", "Authorization": f"token {KITE_API_KEY}:{access_token}"},
+            headers={"X-Kite-Version": "3", "Authorization": f"token {active_key}:{access_token}"},
             timeout=15,
         )
     except requests.exceptions.RequestException as e:
@@ -914,6 +1024,8 @@ def exchange_and_fetch_holdings():
 
     return jsonify({
         "status": "success",
+        "profile": profile_norm,
+        "broker": broker_name,
         "count": len(simplified),
         "holdings": simplified,
         "user": {
