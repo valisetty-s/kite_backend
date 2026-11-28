@@ -954,6 +954,15 @@ def exchange_and_fetch_holdings():
 
     checksum = hashlib.sha256((active_key + request_token + active_secret).encode("utf-8")).hexdigest()
 
+    logger.info(
+        "[CHECKPOINT] profile=%s key=%s..%s (len=%d) secret=%s..%s (len=%d) req_tok=%s..%s (len=%d) checksum_prefix=%s",
+        profile_norm,
+        active_key[:4], active_key[-2:] if len(active_key) >= 2 else "", len(active_key),
+        active_secret[:2], active_secret[-2:] if len(active_secret) >= 2 else "", len(active_secret),
+        request_token[:4], request_token[-2:] if len(request_token) >= 2 else "", len(request_token),
+        checksum[:8],
+    )
+
     try:
         token_resp = requests.post(
             KITE_SESSION_TOKEN_URL,
